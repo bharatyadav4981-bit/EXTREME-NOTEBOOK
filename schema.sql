@@ -343,6 +343,42 @@ create policy "admins can delete any note"
 -- where id = (select id from auth.users where email = 'you@example.com');
 
 -- ------------------------------------------------------------
+-- ROOM ID POOL — reserved admin codes + purchasable VIP numbers
+-- Normal rooms get a random 6-digit code. This pool carves out a small
+-- set of "special" codes: 000001–000005 belong to the admin permanently,
+-- and a separate list of VIP-looking numbers (repeating digits, round
+-- numbers) that any student can claim for an extra one-time fee on top
+-- of their room's monthly price — like a vanity number.
+-- ------------------------------------------------------------
+create table if not exists study_room_vip_codes (
+  code text primary key,
+  is_admin_reserved boolean not null default false,
+  price numeric(10,2) not null default 199,
+  claimed_by uuid references profiles(id) on delete set null,
+  room_id uuid references study_rooms(id) on delete set null,
+  claimed_at timestamptz
+);
+
+insert into study_room_vip_codes (code, is_admin_reserved, price) values
+  ('000001', true, 0), ('000002', true, 0), ('000003', true, 0), ('000004', true, 0), ('000005', true, 0),
+  ('100000', false, 199), ('111111', false, 499), ('123456', false, 299), ('200000', false, 199),
+  ('222222', false, 499), ('300000', false, 199), ('555555', false, 399), ('777777', false, 399),
+  ('888888', false, 349), ('999999', false, 599)
+on conflict (code) do nothing;
+
+alter table study_room_vip_codes enable row level security;
+create policy "vip codes readable by everyone" on study_room_vip_codes for select using (true);
+create policy "admins can manage vip code pricing" on study_room_vip_codes for update
+  using (exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin'));
+create policy "users can claim an available vip number" on study_room_vip_codes for update
+  using (claimed_by is null and is_admin_reserved = false)
+  with check (claimed_by = auth.uid() and is_admin_reserved = false);
+
+-- track a monthly-subscription expiry on approved access, so the host can
+-- see who's still active vs. needs to renew
+alter table study_room_access_requests add column if not exists expires_at timestamptz;
+
+-- ------------------------------------------------------------
 -- STUDY ROOMS (group chat rooms with a 6-digit join code, optional music)
 -- ------------------------------------------------------------
 create table if not exists study_rooms (
@@ -418,8 +454,8 @@ create policy "authenticated users can create rooms" on study_rooms for insert
   with check (
     auth.uid() = created_by
     and (
-      (is_premium = false and price = 0)
-      or exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin')
+      exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin')
+      or (is_premium = true and price > 0)
     )
   );
 
@@ -586,3 +622,112 @@ create policy "users can delete their own uploaded files"
 
 -- Done. Next: create a Storage bucket named "attachments" (public) from
 -- Dashboard → Storage → New bucket, for note PDFs / chat images / avatars.
+
+-- ============================================================
+-- STUDY ROOM UPGRADE — whiteboard, shared notes, tasks, co-host, lock, block
+-- ============================================================
+alter table study_rooms add column if not exists locked boolean not null default false;
+alter table study_room_members add column if not exists co_host boolean not null default false;
+
+create table if not exists study_room_bans (
+  room_id uuid references study_rooms(id) on delete cascade,
+  user_id uuid references profiles(id) on delete cascade,
+  banned_at timestamptz not null default now(),
+  primary key (room_id, user_id)
+);
+
+create table if not exists study_room_notes (
+  room_id uuid primary key references study_rooms(id) on delete cascade,
+  content text not null default '',
+  updated_by uuid references profiles(id) on delete set null,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists study_room_tasks (
+  id uuid primary key default gen_random_uuid(),
+  room_id uuid references study_rooms(id) on delete cascade,
+  content text not null,
+  is_done boolean not null default false,
+  created_by uuid references profiles(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists study_room_whiteboard_strokes (
+  id uuid primary key default gen_random_uuid(),
+  room_id uuid references study_rooms(id) on delete cascade,
+  points jsonb not null,
+  color text not null default '#33E0FF',
+  size int not null default 3,
+  created_by uuid references profiles(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+alter table study_room_bans enable row level security;
+alter table study_room_notes enable row level security;
+alter table study_room_tasks enable row level security;
+alter table study_room_whiteboard_strokes enable row level security;
+
+drop policy if exists "host/admin can view bans" on study_room_bans;
+create policy "host/admin can view bans" on study_room_bans for select
+  using (exists (select 1 from study_rooms r where r.id = room_id and r.created_by = auth.uid())
+         or exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin'));
+drop policy if exists "host/admin can ban" on study_room_bans;
+create policy "host/admin can ban" on study_room_bans for insert
+  with check (exists (select 1 from study_rooms r where r.id = room_id and r.created_by = auth.uid())
+              or exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin'));
+drop policy if exists "host/admin can unban" on study_room_bans;
+create policy "host/admin can unban" on study_room_bans for delete
+  using (exists (select 1 from study_rooms r where r.id = room_id and r.created_by = auth.uid())
+         or exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin'));
+
+drop policy if exists "members can read shared notes" on study_room_notes;
+create policy "members can read shared notes" on study_room_notes for select
+  using (exists (select 1 from study_room_members m where m.room_id = study_room_notes.room_id and m.user_id = auth.uid())
+         or exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin'));
+drop policy if exists "members can create shared notes" on study_room_notes;
+create policy "members can create shared notes" on study_room_notes for insert
+  with check (exists (select 1 from study_room_members m where m.room_id = room_id and m.user_id = auth.uid()));
+drop policy if exists "members can edit shared notes" on study_room_notes;
+create policy "members can edit shared notes" on study_room_notes for update
+  using (exists (select 1 from study_room_members m where m.room_id = study_room_notes.room_id and m.user_id = auth.uid()));
+
+drop policy if exists "members can read tasks" on study_room_tasks;
+create policy "members can read tasks" on study_room_tasks for select
+  using (exists (select 1 from study_room_members m where m.room_id = study_room_tasks.room_id and m.user_id = auth.uid())
+         or exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin'));
+drop policy if exists "members can add tasks" on study_room_tasks;
+create policy "members can add tasks" on study_room_tasks for insert
+  with check (auth.uid() = created_by and exists (select 1 from study_room_members m where m.room_id = room_id and m.user_id = auth.uid()));
+drop policy if exists "members can update tasks" on study_room_tasks;
+create policy "members can update tasks" on study_room_tasks for update
+  using (exists (select 1 from study_room_members m where m.room_id = study_room_tasks.room_id and m.user_id = auth.uid()));
+drop policy if exists "members can delete tasks" on study_room_tasks;
+create policy "members can delete tasks" on study_room_tasks for delete
+  using (exists (select 1 from study_room_members m where m.room_id = study_room_tasks.room_id and m.user_id = auth.uid()));
+
+drop policy if exists "members can read whiteboard" on study_room_whiteboard_strokes;
+create policy "members can read whiteboard" on study_room_whiteboard_strokes for select
+  using (exists (select 1 from study_room_members m where m.room_id = study_room_whiteboard_strokes.room_id and m.user_id = auth.uid())
+         or exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin'));
+drop policy if exists "members can draw on whiteboard" on study_room_whiteboard_strokes;
+create policy "members can draw on whiteboard" on study_room_whiteboard_strokes for insert
+  with check (auth.uid() = created_by and exists (select 1 from study_room_members m where m.room_id = room_id and m.user_id = auth.uid()));
+drop policy if exists "members can clear whiteboard" on study_room_whiteboard_strokes;
+create policy "members can clear whiteboard" on study_room_whiteboard_strokes for delete
+  using (exists (select 1 from study_room_members m where m.room_id = study_room_whiteboard_strokes.room_id and m.user_id = auth.uid()));
+
+do $$
+begin
+  begin
+    alter publication supabase_realtime add table study_room_whiteboard_strokes;
+  exception when duplicate_object then null;
+  end;
+  begin
+    alter publication supabase_realtime add table study_room_tasks;
+  exception when duplicate_object then null;
+  end;
+  begin
+    alter publication supabase_realtime add table study_room_notes;
+  exception when duplicate_object then null;
+  end;
+end $$;

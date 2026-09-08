@@ -37,6 +37,7 @@ const ICONS = {
   timer:'<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l3 2M9 2h6"/></svg>',
   rooms:'<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3"/><path d="M2.5 20c0-3.5 3-6 6.5-6s6.5 2.5 6.5 6"/><circle cx="18" cy="9" r="2.3"/><path d="M15.5 14c2.8.3 5 2.3 5 5.5"/></svg>',
   music:'<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>',
+  x:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>',
 };
 
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -143,6 +144,13 @@ const state = {
   nowPlayingChannel: null,
   noise: { ctx:null, source:null, gain:null, playing:false, type:'white' },
   call: { active:false, roomId:null, localStream:null, peers:{}, channel:null, micOn:true, camOn:true },
+  roomTab: 'call',
+  whiteboard: { color:'#33E0FF', size:3, erasing:false },
+  whiteboardChannel: null,
+  notesChannel: null,
+  tasksChannel: null,
+  roomTasks: [],
+  roomMembersFull: [],
   bookmarkIds: new Set(),
   openNote: null,
   questions: [],
@@ -214,22 +222,52 @@ async function updatePassword(newPassword){
 
 /* ============ DATA LAYER ============ */
 async function generateRoomCode(){
-  for (let attempt=0; attempt<5; attempt++){
+  const { data: taken } = await supabase.from('study_room_vip_codes').select('code');
+  const reserved = new Set((taken||[]).map(v=>v.code));
+  for (let attempt=0; attempt<8; attempt++){
     const code = String(Math.floor(100000 + Math.random()*900000));
+    if (reserved.has(code)) continue;
     const { data } = await supabase.from('study_rooms').select('id').eq('room_code', code).maybeSingle();
     if (!data) return code;
   }
   return String(Date.now()).slice(-6);
 }
-async function createStudyRoom(name, isPremium, price){
-  const code = await generateRoomCode();
+async function fetchAvailableRoomCodes(){
+  const { data } = await supabase.from('study_room_vip_codes').select('*').is('claimed_by', null).order('is_admin_reserved', { ascending:false }).order('code');
+  return data || [];
+}
+async function createStudyRoom(name, isPremium, price, vipCode){
   const isAdmin = state.profile?.role === 'admin';
-  // Only an admin's room can carry a price — matches the DB policy, but we
-  // also guard here so non-admins get a clean room instead of a DB error.
-  const premium = isAdmin ? !!isPremium : false;
-  const finalPrice = isAdmin && premium ? Math.max(0, Number(price) || 0) : 0;
+  // Admins can create a room free or VIP, however they like. Anyone else
+  // creating their own room must attach a monthly price — they can still
+  // invite specific friends in for free afterwards from "Manage room", but
+  // a stranger joining by code has to request access (and, in effect, pay).
+  const premium = isAdmin ? !!isPremium : true;
+  const finalPrice = isAdmin ? (premium ? Math.max(0, Number(price) || 0) : 0) : Math.max(1, Number(price) || 0);
+
+  let code;
+  if (vipCode){
+    const { data: codeRow } = await supabase.from('study_room_vip_codes').select('*').eq('code', vipCode).maybeSingle();
+    if (!codeRow) throw new Error('That room number is not available');
+    if (codeRow.is_admin_reserved && !isAdmin) throw new Error('That number is reserved for the host/admin');
+    if (codeRow.is_admin_reserved){
+      await supabase.from('study_room_vip_codes').update({ claimed_by: state.session.user.id, claimed_at: new Date().toISOString() }).eq('code', vipCode);
+    } else {
+      if (codeRow.claimed_by) throw new Error('That number was just taken — pick another');
+      const { data: claimed, error: claimErr } = await supabase.from('study_room_vip_codes')
+        .update({ claimed_by: state.session.user.id, claimed_at: new Date().toISOString() })
+        .eq('code', vipCode).is('claimed_by', null).select();
+      if (claimErr) throw claimErr;
+      if (!claimed || !claimed.length) throw new Error('That number was just taken — pick another');
+    }
+    code = vipCode;
+  } else {
+    code = await generateRoomCode();
+  }
+
   const { data, error } = await supabase.from('study_rooms').insert({ room_code: code, name, created_by: state.session.user.id, is_premium: premium, price: finalPrice }).select().single();
   if (error) throw error;
+  if (vipCode) await supabase.from('study_room_vip_codes').update({ room_id: data.id }).eq('code', vipCode);
   await supabase.from('study_room_members').insert({ room_id: data.id, user_id: state.session.user.id });
   return data;
 }
@@ -242,14 +280,20 @@ async function loadMyRooms(){
   state.rooms = data || [];
 }
 // Host/admin always join their own (or any) room for free. Everyone else
-// needs an approved access request before they can join a VIP room —
-// price is just informational here since there's no backend to charge
-// a variable amount; the host approves once payment is settled outside the app.
+// needs an approved (and unexpired) access request before they can join a
+// VIP room — price is monthly and is just informational here since there's
+// no backend to charge a recurring amount; the host approves once payment
+// is settled outside the app, and the approval carries a 30-day expiry.
 async function joinRoomByCode(code){
   const { data: room } = await supabase.from('study_rooms').select('*').eq('room_code', code.trim()).maybeSingle();
   if (!room) throw new Error('No room found with that code');
   const isAdmin = state.profile.role === 'admin';
   const isHost = room.created_by === state.session.user.id;
+  if (!isAdmin && !isHost){
+    const { data: ban } = await supabase.from('study_room_bans').select('*').eq('room_id', room.id).eq('user_id', state.session.user.id).maybeSingle();
+    if (ban) throw new Error('You were removed from this room by the host and can no longer rejoin.');
+    if (room.locked) throw new Error('This room is locked by the host right now — ask them to open it.');
+  }
   if (room.is_premium && !isAdmin && !isHost){
     const { data: access } = await supabase.from('study_room_access_requests').select('*').eq('room_id', room.id).eq('user_id', state.session.user.id).maybeSingle();
     if (access?.status === 'pending'){
@@ -257,8 +301,9 @@ async function joinRoomByCode(code){
       err.pending = true;
       throw err;
     }
-    if (access?.status !== 'approved'){
-      const err = new Error(`This is a VIP room${room.price>0?` (₹${room.price})`:''}. Ask the host to approve your access.`);
+    const expired = access?.expires_at && new Date(access.expires_at) < new Date();
+    if (access?.status !== 'approved' || expired){
+      const err = new Error(`This is a VIP room${room.price>0?` (₹${room.price}/month)`:''}. ${expired ? 'Your subscription has expired — ask the host to renew you.' : 'Ask the host to approve your access.'}`);
       err.needsAccess = true;
       err.room = room;
       throw err;
@@ -276,16 +321,166 @@ async function loadRoomAccessRequests(roomId){
   const { data } = await supabase.from('study_room_access_requests').select('*, profiles(username,name,avatar_url)').eq('room_id', roomId).eq('status','pending').order('created_at', { ascending:true });
   state.roomAccessRequests = data || [];
 }
+async function loadRoomMembers(roomId){
+  const { data } = await supabase.from('study_room_access_requests').select('*, profiles(username,name,avatar_url)').eq('room_id', roomId).eq('status','approved').order('resolved_at', { ascending:false });
+  return data || [];
+}
 async function resolveRoomAccessRequest(request, approve){
-  await supabase.from('study_room_access_requests').update({ status: approve?'approved':'rejected', resolved_at: new Date().toISOString() }).eq('id', request.id);
+  const expiresAt = approve ? new Date(Date.now() + 30*24*60*60*1000).toISOString() : null;
+  await supabase.from('study_room_access_requests').update({ status: approve?'approved':'rejected', resolved_at: new Date().toISOString(), expires_at: expiresAt }).eq('id', request.id);
   if (approve){
     await supabase.from('study_room_members').upsert({ room_id: request.room_id, user_id: request.user_id });
   }
+}
+async function renewRoomAccess(requestId){
+  await supabase.from('study_room_access_requests').update({ expires_at: new Date(Date.now() + 30*24*60*60*1000).toISOString() }).eq('id', requestId);
 }
 async function updateRoomSettings(roomId, { isPremium, price, pinnedMessage }){
   const { error } = await supabase.from('study_rooms').update({ is_premium: !!isPremium, price: isPremium ? Math.max(0, Number(price)||0) : 0, pinned_message: pinnedMessage || null }).eq('id', roomId);
   if (error) throw error;
 }
+
+/* ---- Member management: co-host, remove, block, lock room ---- */
+async function loadAllRoomMembers(roomId){
+  const { data } = await supabase.from('study_room_members').select('*, profiles(username,name,avatar_url,role)').eq('room_id', roomId).order('joined_at');
+  return data || [];
+}
+async function setCoHost(roomId, userId, value){
+  await supabase.from('study_room_members').update({ co_host: value }).eq('room_id', roomId).eq('user_id', userId);
+}
+async function removeMember(roomId, userId){
+  await supabase.from('study_room_members').delete().eq('room_id', roomId).eq('user_id', userId);
+}
+async function banMember(roomId, userId){
+  await supabase.from('study_room_bans').insert({ room_id: roomId, user_id: userId });
+  await removeMember(roomId, userId);
+}
+async function toggleRoomLock(roomId, locked){
+  await supabase.from('study_rooms').update({ locked }).eq('id', roomId);
+}
+function requestMuteFromHost(targetUserId){
+  if (!state.call.channel){ toast('Start the call first'); return; }
+  state.call.channel.send({ type:'broadcast', event:'mute-request', payload:{ target: targetUserId, from: state.session.user.id } });
+  toast('Asked them to mute their mic');
+}
+
+/* ---- Shared whiteboard (canvas strokes synced over Realtime) ---- */
+async function loadWhiteboardStrokes(roomId){
+  const { data } = await supabase.from('study_room_whiteboard_strokes').select('*').eq('room_id', roomId).order('created_at');
+  return data || [];
+}
+async function addWhiteboardStroke(roomId, points, color, size){
+  const { error } = await supabase.from('study_room_whiteboard_strokes').insert({ room_id: roomId, points, color, size, created_by: state.session.user.id });
+  if (error) throw error;
+}
+async function clearWhiteboardDB(roomId){
+  await supabase.from('study_room_whiteboard_strokes').delete().eq('room_id', roomId);
+}
+function drawStrokeOnCanvas(canvas, stroke){
+  if (!canvas || !stroke.points || stroke.points.length < 2) return;
+  const ctx = canvas.getContext('2d');
+  ctx.strokeStyle = stroke.color; ctx.lineWidth = stroke.size; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(stroke.points[0].x * canvas.width, stroke.points[0].y * canvas.height);
+  for (let i=1;i<stroke.points.length;i++) ctx.lineTo(stroke.points[i].x * canvas.width, stroke.points[i].y * canvas.height);
+  ctx.stroke();
+}
+function subscribeWhiteboard(roomId, canvas){
+  if (state.whiteboardChannel) supabase.removeChannel(state.whiteboardChannel);
+  state.whiteboardChannel = supabase.channel('wb-'+roomId)
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'study_room_whiteboard_strokes', filter:`room_id=eq.${roomId}` }, payload => {
+      if (payload.new.created_by === state.session.user.id) return;
+      drawStrokeOnCanvas(document.getElementById('whiteboardCanvas'), payload.new);
+    })
+    .on('broadcast', { event:'wb-clear' }, () => {
+      const c = document.getElementById('whiteboardCanvas');
+      if (c) c.getContext('2d').clearRect(0,0,c.width,c.height);
+    })
+    .subscribe();
+}
+function setupWhiteboardCanvas(canvas, roomId){
+  let drawing = false, points = [];
+  function relPos(e){
+    const rect = canvas.getBoundingClientRect();
+    const t = e.touches ? e.touches[0] : e;
+    return { x: (t.clientX - rect.left) / rect.width, y: (t.clientY - rect.top) / rect.height };
+  }
+  function currentColor(){ return state.whiteboard.erasing ? '#0B0F1A' : state.whiteboard.color; }
+  function currentSize(){ return state.whiteboard.erasing ? state.whiteboard.size * 6 : state.whiteboard.size; }
+  function start(e){ drawing = true; points = [relPos(e)]; e.preventDefault(); }
+  function move(e){
+    if (!drawing) return;
+    const p = relPos(e);
+    drawStrokeOnCanvas(canvas, { points:[points[points.length-1], p], color: currentColor(), size: currentSize() });
+    points.push(p);
+    e.preventDefault();
+  }
+  async function end(){
+    if (!drawing) return;
+    drawing = false;
+    if (points.length > 1){
+      try{ await addWhiteboardStroke(roomId, points, currentColor(), currentSize()); }catch(e){}
+    }
+    points = [];
+  }
+  canvas.addEventListener('mousedown', start);
+  canvas.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', end);
+  canvas.addEventListener('touchstart', start, { passive:false });
+  canvas.addEventListener('touchmove', move, { passive:false });
+  canvas.addEventListener('touchend', end);
+}
+async function clearWhiteboard(roomId){
+  await clearWhiteboardDB(roomId);
+  state.whiteboardChannel?.send({ type:'broadcast', event:'wb-clear', payload:{} });
+  const c = document.getElementById('whiteboardCanvas');
+  if (c) c.getContext('2d').clearRect(0,0,c.width,c.height);
+}
+
+/* ---- Shared notes scratchpad ---- */
+async function loadRoomNotesText(roomId){
+  const { data } = await supabase.from('study_room_notes').select('*').eq('room_id', roomId).maybeSingle();
+  return data?.content || '';
+}
+let notesSaveTimer = null;
+async function saveRoomNotesText(roomId, content){
+  await supabase.from('study_room_notes').upsert({ room_id: roomId, content, updated_by: state.session.user.id, updated_at: new Date().toISOString() });
+}
+function subscribeRoomNotes(roomId, textarea){
+  if (state.notesChannel) supabase.removeChannel(state.notesChannel);
+  state.notesChannel = supabase.channel('notes-'+roomId)
+    .on('postgres_changes', { event:'*', schema:'public', table:'study_room_notes', filter:`room_id=eq.${roomId}` }, payload => {
+      if (payload.new?.updated_by === state.session.user.id) return;
+      if (document.activeElement !== textarea) textarea.value = payload.new?.content || '';
+    })
+    .subscribe();
+}
+
+/* ---- Shared tasks checklist ---- */
+async function loadRoomTasks(roomId){
+  const { data } = await supabase.from('study_room_tasks').select('*').eq('room_id', roomId).order('created_at');
+  return data || [];
+}
+async function addRoomTask(roomId, content){
+  const { error } = await supabase.from('study_room_tasks').insert({ room_id: roomId, content, created_by: state.session.user.id });
+  if (error) throw error;
+}
+async function toggleRoomTask(taskId, isDone){
+  await supabase.from('study_room_tasks').update({ is_done: isDone }).eq('id', taskId);
+}
+async function deleteRoomTask(taskId){
+  await supabase.from('study_room_tasks').delete().eq('id', taskId);
+}
+function subscribeRoomTasks(roomId, onChange){
+  if (state.tasksChannel) supabase.removeChannel(state.tasksChannel);
+  state.tasksChannel = supabase.channel('tasks-'+roomId)
+    .on('postgres_changes', { event:'*', schema:'public', table:'study_room_tasks', filter:`room_id=eq.${roomId}` }, async () => {
+      state.roomTasks = await loadRoomTasks(roomId);
+      onChange();
+    })
+    .subscribe();
+}
+
 async function loadRoomMessages(roomId){
   const { data } = await supabase.from('study_room_messages').select('*, profiles(username,name,avatar_url,role)').eq('room_id', roomId).order('created_at', { ascending:true }).limit(100);
   state.roomMessages = data || [];
@@ -1760,6 +1955,9 @@ async function startCall(roomId){
     if (entry && payload.candidate){ try{ await entry.pc.addIceCandidate(new RTCIceCandidate(payload.candidate)); }catch(e){} }
   });
   channel.on('broadcast', { event:'leave' }, ({ payload }) => { removeCallPeer(payload.userId); });
+  channel.on('broadcast', { event:'mute-request' }, ({ payload }) => {
+    if (payload.target === myId && state.call.micOn){ toggleMic(); toast('The host asked you to mute your mic'); }
+  });
   channel.subscribe(status => {
     if (status === 'SUBSCRIBED') channel.send({ type:'broadcast', event:'join', payload:{ userId: myId, name: myName } });
   });
@@ -1817,20 +2015,21 @@ async function renderRooms(){
   if (state.activeRoomId){ await renderRoomChat(el); return; }
   el.innerHTML = `
     <div class="section-head"><h2>Study Rooms</h2></div>
-    <p style="font-size:12px;color:var(--ink-faint);margin:-10px 0 16px;">Study together in real time. Each room has a 6-digit code — share it with friends.</p>
-    <div class="card">
-      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button class="btn btn-primary btn-sm" id="createRoomBtn">+ Create a room</button>
-        <input id="joinCodeInput" placeholder="Enter 6-digit code" maxlength="6" style="flex:1;min-width:140px;border:1px solid var(--hair-strong);border-radius:9px;padding:8px 10px;font-size:14px;background:var(--paper);color:var(--ink);">
-        <button class="btn btn-secondary btn-sm" id="joinCodeBtn">Join</button>
+    <p style="font-size:12px;color:var(--ink-faint);margin:-10px 0 16px;">Study together in real time, video call, and play music together. Every room has its own 6-digit number — share it with friends.</p>
+    <div class="room-join-bar">
+      <button class="btn btn-primary btn-sm" id="createRoomBtn">${ICONS.plus} Create a room</button>
+      <div class="room-join-input">
+        <span>#</span>
+        <input id="joinCodeInput" placeholder="Enter room number" maxlength="6" inputmode="numeric">
       </div>
+      <button class="btn btn-secondary btn-sm" id="joinCodeBtn">Join</button>
     </div>
-    <div id="roomsList"></div>
+    <div id="roomsList" class="room-grid"></div>
   `;
   document.getElementById('createRoomBtn').addEventListener('click', openCreateRoomModal);
   document.getElementById('joinCodeBtn').addEventListener('click', async ()=>{
     const code = document.getElementById('joinCodeInput').value.trim();
-    if (code.length !== 6){ toast('Enter the 6-digit room code'); return; }
+    if (code.length !== 6){ toast('Enter the 6-digit room number'); return; }
     try{
       await joinRoomByCode(code);
       await loadMyRooms();
@@ -1843,19 +2042,30 @@ async function renderRooms(){
   });
   const list = el.querySelector('#roomsList');
   const isAdmin = state.profile?.role === 'admin';
-  list.innerHTML = state.rooms.length ? state.rooms.map(r=>{
+  const banners = ['rb-indigo','rb-amber','rb-green','rb-coral','rb-grape'];
+  list.innerHTML = state.rooms.length ? state.rooms.map((r,i)=>{
     const isHost = r.created_by === state.session.user.id;
+    const banner = banners[i % banners.length];
     return `
-    <div class="card" data-room="${r.id}" style="cursor:pointer;">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
-        <div style="min-width:0;flex:1;"><p class="note-title" style="word-break:break-word;">${esc(r.name)} ${r.is_premium?`<span class="tag" style="background:var(--amber-soft);color:#7A5410;white-space:nowrap;">${ICONS.crown} VIP${r.price>0?` · ₹${r.price}`:''}</span>`:''}</p><p class="note-excerpt">Code: ${r.room_code}${isHost?' · You host this room':''}</p></div>
-        ${(isAdmin||isHost) ? `<button class="btn btn-secondary btn-sm" data-manage-room="${r.id}" style="flex-shrink:0;">Manage</button>` : ''}
+    <div class="room-card ${r.is_premium?'room-card-vip':''}" data-room="${r.id}">
+      <div class="room-card-banner ${banner}">
+        ${r.is_premium ? `<span class="room-vip-badge">${ICONS.crown} VIP</span>` : ''}
+        ${r.locked ? `<span class="room-vip-badge" style="color:var(--red);">🔒 Locked</span>` : ''}
+        <span class="room-card-emoji">📚</span>
+      </div>
+      <div class="room-card-body">
+        <p class="room-card-title">${esc(r.name)}</p>
+        <div class="room-card-code">#${r.room_code}</div>
+        <p class="room-card-meta">${isHost ? 'You host this room' : (r.is_premium ? `₹${r.price}/month` : 'Free room')}</p>
+        <div class="room-card-actions">
+          <button class="btn btn-primary btn-sm" data-enter-room="${r.id}" style="flex:1;justify-content:center;">Enter</button>
+          ${(isAdmin||isHost) ? `<button class="btn btn-secondary btn-sm" data-manage-room="${r.id}">Manage</button>` : ''}
+        </div>
       </div>
     </div>`;
-  }).join('') : `<div class="empty"><p>No rooms yet. Create one or join with a code.</p></div>`;
-  list.querySelectorAll('[data-room]').forEach(c=>c.addEventListener('click', async e=>{
-    if (e.target.closest('[data-manage-room]')) return;
-    state.activeRoomId = c.dataset.room;
+  }).join('') : `<div class="empty"><p>No rooms yet. Create one or join with a number.</p></div>`;
+  list.querySelectorAll('[data-enter-room]').forEach(b=>b.addEventListener('click', async ()=>{
+    state.activeRoomId = b.dataset.enterRoom;
     await loadRoomMessages(state.activeRoomId);
     subscribeRoomChannel(state.activeRoomId);
     await loadNowPlaying(state.activeRoomId);
@@ -1868,17 +2078,31 @@ async function renderRooms(){
     await openManageRoomModal(room);
   }));
 }
-function openCreateRoomModal(){
+async function openCreateRoomModal(){
   const isAdmin = state.profile?.role === 'admin';
+  let codes = [];
+  try{ codes = await fetchAvailableRoomCodes(); }catch(e){ codes = []; }
+  const reserved = codes.filter(c=>c.is_admin_reserved);
+  const vip = codes.filter(c=>!c.is_admin_reserved);
   openModal(`
     <div class="modal">
       <h3>Create a study room</h3>
       <label>Room name</label><input id="mrName" placeholder="e.g. NEET Biology Group">
+      <label style="margin-top:10px;">Room number</label>
+      <select id="mrCode">
+        <option value="">🎲 Random 6-digit number (free)</option>
+        ${isAdmin ? reserved.map(c=>`<option value="${c.code}">👑 ${c.code} — Admin reserved</option>`).join('') : ''}
+        ${vip.map(c=>`<option value="${c.code}">✨ ${c.code} — VIP number (+₹${c.price} one-time)</option>`).join('')}
+      </select>
       ${isAdmin ? `
-        <label style="display:flex;align-items:center;gap:8px;margin-top:10px;"><input type="checkbox" id="mrPremium" style="width:auto;margin:0;"> VIP room (you set the price, subscribers only)</label>
-        <div id="mrPriceWrap" style="display:none;margin-top:8px;"><label>Price (₹)</label><input id="mrPrice" type="number" min="0" step="1" placeholder="e.g. 99"></div>
-        <p style="font-size:11.5px;color:var(--ink-faint);margin-top:6px;">As the host, you and other admins always join for free — the price only applies to other students, and they'll need your approval to get in.</p>
-      ` : `<p style="font-size:11.5px;color:var(--ink-faint);margin-top:8px;">This room is free — only admins can create VIP/paid rooms.</p>`}
+        <label style="display:flex;align-items:center;gap:8px;margin-top:10px;"><input type="checkbox" id="mrPremium" style="width:auto;margin:0;"> VIP room (you set the monthly price, subscribers only)</label>
+        <div id="mrPriceWrap" style="display:none;margin-top:8px;"><label>Price (₹ / month)</label><input id="mrPrice" type="number" min="0" step="1" placeholder="e.g. 99"></div>
+        <p style="font-size:11.5px;color:var(--ink-faint);margin-top:6px;">As the host, you and other admins always join for free. You can also invite specific people in for free afterwards from "Manage room" — the price only applies to strangers joining by code.</p>
+      ` : `
+        <label style="margin-top:10px;">Monthly price for joiners (₹)</label>
+        <input id="mrPrice" type="number" min="1" step="1" placeholder="e.g. 49" value="49">
+        <p style="font-size:11.5px;color:var(--ink-faint);margin-top:6px;">You (the host) always join free, and you can invite specific friends in for free too — this monthly price only applies to strangers who join using your room's code.</p>
+      `}
       <div class="modal-actions"><button class="btn btn-secondary" id="cancelRoom">Cancel</button><button class="btn btn-primary" id="saveRoom">Create</button></div>
     </div>
   `);
@@ -1891,10 +2115,12 @@ function openCreateRoomModal(){
     if (!name){ toast('Give the room a name'); return; }
     const isPremium = document.getElementById('mrPremium')?.checked || false;
     const price = document.getElementById('mrPrice')?.value || 0;
+    const vipCode = document.getElementById('mrCode').value || null;
+    if (!isAdmin && Number(price) <= 0){ toast('Set a price of at least ₹1 for your room'); return; }
     try{
-      const room = await createStudyRoom(name, isPremium, price);
+      const room = await createStudyRoom(name, isPremium, price, vipCode);
       closeModal();
-      toast(`Room created — code: ${room.room_code}`);
+      toast(`Room created — number: ${room.room_code}`);
       await loadMyRooms();
       renderRoute();
     }catch(err){ toast(err.message || 'Could not create room'); }
@@ -1904,7 +2130,7 @@ function openRequestAccessModal(room){
   openModal(`
     <div class="modal">
       <h3>${ICONS.crown} VIP room</h3>
-      <p style="font-size:13.5px;color:var(--ink-soft);">"${esc(room.name)}" is a paid room${room.price>0?` (₹${room.price})`:''}. Send a request and the host will approve you once things are sorted.</p>
+      <p style="font-size:13.5px;color:var(--ink-soft);">"${esc(room.name)}" is a paid room${room.price>0?` (₹${room.price}/month)`:''}. Send a request and the host will approve you once things are sorted.</p>
       <div class="modal-actions"><button class="btn btn-secondary" id="cancelReq">Cancel</button><button class="btn btn-primary" id="sendReq">Request access</button></div>
     </div>
   `);
@@ -1917,16 +2143,49 @@ function openRequestAccessModal(room){
     }catch(err){ toast(err.message || 'Could not send request'); }
   });
 }
+async function inviteUserToRoom(roomId, username){
+  const { data: target } = await supabase.from('profiles').select('id').eq('username', username.trim()).maybeSingle();
+  if (!target) throw new Error('No user found with that username');
+  const { error } = await supabase.from('study_room_members').upsert({ room_id: roomId, user_id: target.id });
+  if (error) throw error;
+}
 async function openManageRoomModal(room){
   await loadRoomAccessRequests(room.id);
   const reqs = state.roomAccessRequests;
+  const members = await loadRoomMembers(room.id);
+  const allMembers = await loadAllRoomMembers(room.id);
+  const myId = state.session.user.id;
   openModal(`
     <div class="modal">
       <h3>Manage "${esc(room.name)}"</h3>
-      <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="mgPremium" style="width:auto;margin:0;" ${room.is_premium?'checked':''}> VIP room</label>
-      <div id="mgPriceWrap" style="display:${room.is_premium?'block':'none'};margin-top:8px;"><label>Price (₹)</label><input id="mgPrice" type="number" min="0" step="1" value="${room.price||0}"></div>
+      <p style="font-size:12px;color:var(--ink-faint);margin:-4px 0 12px;">Room number: <strong style="color:var(--ink);">#${room.room_code}</strong></p>
+      <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="mgLocked" style="width:auto;margin:0;" ${room.locked?'checked':''}> 🔒 Lock room (no new joins right now)</label>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:8px;"><input type="checkbox" id="mgPremium" style="width:auto;margin:0;" ${room.is_premium?'checked':''}> VIP room</label>
+      <div id="mgPriceWrap" style="display:${room.is_premium?'block':'none'};margin-top:8px;"><label>Price (₹ / month)</label><input id="mgPrice" type="number" min="0" step="1" value="${room.price||0}"></div>
       <label style="margin-top:10px;">Pinned message (shown at the top of the chat)</label>
       <input id="mgPinned" placeholder="e.g. Today's syllabus: Chapter 4" value="${esc(room.pinned_message||'')}">
+      <div style="height:1px;background:var(--hair);margin:14px 0;"></div>
+      <p style="font-size:12px;font-weight:600;margin:0 0 6px;">Invite someone directly (always free, even in a VIP room)</p>
+      <div style="display:flex;gap:8px;">
+        <input id="mgInviteUsername" placeholder="Their username">
+        <button class="btn btn-secondary btn-sm" id="mgInviteBtn">Invite</button>
+      </div>
+      <p style="font-size:12px;font-weight:600;margin:14px 0 6px;">Members (${allMembers.length})</p>
+      <div style="max-height:200px;overflow-y:auto;">
+        ${allMembers.map(m=>{
+          const isMe = m.user_id === myId;
+          const isRoomHost = m.user_id === room.created_by;
+          return `<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;padding:6px 0;border-bottom:1px solid var(--hair);flex-wrap:wrap;">
+            <span style="font-size:13px;min-width:0;word-break:break-word;">${esc(m.profiles?.name || m.profiles?.username || 'Student')} ${isRoomHost?'<span class="tag" style="background:var(--amber-soft);color:#7A5410;">Host</span>':m.co_host?'<span class="tag">Co-Host</span>':''}</span>
+            ${(!isMe && !isRoomHost) ? `<span style="display:flex;gap:4px;flex-shrink:0;flex-wrap:wrap;">
+              <button class="btn btn-secondary btn-sm" data-mute="${m.user_id}" title="Ask to mute">🔇</button>
+              <button class="btn btn-secondary btn-sm" data-cohost="${m.user_id}" data-current="${m.co_host}">${m.co_host?'Remove co-host':'Make co-host'}</button>
+              <button class="btn btn-secondary btn-sm" data-remove="${m.user_id}">Remove</button>
+              <button class="btn btn-danger btn-sm" data-block="${m.user_id}">Block</button>
+            </span>` : ''}
+          </div>`;
+        }).join('')}
+      </div>
       ${reqs.length ? `
         <p style="font-size:12px;font-weight:600;margin:14px 0 6px;">Pending access requests</p>
         <div style="max-height:160px;overflow-y:auto;">
@@ -1939,7 +2198,23 @@ async function openManageRoomModal(room){
               </span>
             </div>`).join('')}
         </div>
-      ` : `<p style="font-size:12px;color:var(--ink-faint);margin-top:14px;">No pending requests right now.</p>`}
+      ` : ''}
+      ${room.is_premium && members.length ? `
+        <p style="font-size:12px;font-weight:600;margin:14px 0 6px;">Subscribers</p>
+        <div style="max-height:160px;overflow-y:auto;">
+          ${members.map(m=>{
+            const expired = m.expires_at && new Date(m.expires_at) < new Date();
+            const daysLeft = m.expires_at ? Math.ceil((new Date(m.expires_at) - new Date())/86400000) : null;
+            return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--hair);flex-wrap:wrap;">
+              <span style="font-size:13px;min-width:0;word-break:break-word;">${esc(m.profiles?.name || m.profiles?.username || 'Student')}</span>
+              <span style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+                <span style="font-size:11px;color:${expired?'var(--red)':'var(--ink-faint)'};">${expired ? 'Expired' : `${daysLeft}d left`}</span>
+                <button class="btn btn-secondary btn-sm" data-renew="${m.id}">Renew 30d</button>
+              </span>
+            </div>`;
+          }).join('')}
+        </div>
+      ` : ''}
       <div class="modal-actions"><button class="btn btn-secondary" id="cancelMg">Close</button><button class="btn btn-primary" id="saveMg">Save changes</button></div>
     </div>
   `);
@@ -1947,13 +2222,49 @@ async function openManageRoomModal(room){
   document.getElementById('mgPremium').addEventListener('change', e=>{
     document.getElementById('mgPriceWrap').style.display = e.target.checked ? 'block' : 'none';
   });
-  document.querySelectorAll('[data-approve],[data-reject]').forEach(b=>b.addEventListener('click', async ()=>{
-    const req = reqs.find(r=>r.id === (b.dataset.approve || b.dataset.reject));
-    await resolveRoomAccessRequest(req, !!b.dataset.approve);
-    toast(b.dataset.approve ? 'Access approved' : 'Request rejected');
+  document.getElementById('mgLocked').addEventListener('change', async e=>{
+    await toggleRoomLock(room.id, e.target.checked);
+    toast(e.target.checked ? 'Room locked — no new joins' : 'Room unlocked');
+  });
+  document.querySelectorAll('[data-mute]').forEach(b=>b.addEventListener('click', ()=>requestMuteFromHost(b.dataset.mute)));
+  document.querySelectorAll('[data-cohost]').forEach(b=>b.addEventListener('click', async ()=>{
+    await setCoHost(room.id, b.dataset.cohost, b.dataset.current !== 'true');
     closeModal();
     await openManageRoomModal(room);
   }));
+  document.querySelectorAll('[data-remove]').forEach(b=>b.addEventListener('click', async ()=>{
+    if (!confirm('Remove this person from the room?')) return;
+    await removeMember(room.id, b.dataset.remove);
+    toast('Removed from room');
+    closeModal();
+    await openManageRoomModal(room);
+  }));
+  document.querySelectorAll('[data-block]').forEach(b=>b.addEventListener('click', async ()=>{
+    if (!confirm('Block this person? They will not be able to rejoin with the room code.')) return;
+    await banMember(room.id, b.dataset.block);
+    toast('Blocked from room');
+    closeModal();
+    await openManageRoomModal(room);
+  }));
+  document.querySelectorAll('[data-approve],[data-reject]').forEach(b=>b.addEventListener('click', async ()=>{
+    const req = reqs.find(r=>r.id === (b.dataset.approve || b.dataset.reject));
+    await resolveRoomAccessRequest(req, !!b.dataset.approve);
+    toast(b.dataset.approve ? 'Access approved for 30 days' : 'Request rejected');
+    closeModal();
+    await openManageRoomModal(room);
+  }));
+  document.querySelectorAll('[data-renew]').forEach(b=>b.addEventListener('click', async ()=>{
+    await renewRoomAccess(b.dataset.renew);
+    toast('Subscription renewed for 30 days');
+    closeModal();
+    await openManageRoomModal(room);
+  }));
+  document.getElementById('mgInviteBtn').addEventListener('click', async ()=>{
+    const username = document.getElementById('mgInviteUsername').value.trim();
+    if (!username) return;
+    try{ await inviteUserToRoom(room.id, username); toast(`${username} added to the room for free`); document.getElementById('mgInviteUsername').value=''; }
+    catch(err){ toast(err.message); }
+  });
   document.getElementById('saveMg').addEventListener('click', async ()=>{
     const isPremium = document.getElementById('mgPremium').checked;
     const price = document.getElementById('mgPrice')?.value || 0;
@@ -1972,74 +2283,56 @@ async function renderRoomChat(el){
   if (!room){ state.activeRoomId = null; return renderRooms(); }
   const isAdmin = state.profile?.role === 'admin';
   const isHost = room.created_by === state.session.user.id;
+  const members = await loadAllRoomMembers(room.id);
+  state.roomMembersFull = members;
+  state.roomTab = state.roomTab || 'call';
+
   el.innerHTML = `
-    <div class="thread-header">
-      <button class="back" id="backToRooms">${ICONS.back}</button>
-      <div class="info"><p class="name">${esc(room.name)} ${room.is_premium?`<span title="VIP room" style="color:var(--amber);">${ICONS.crown}</span>`:''}</p><p class="status" style="color:var(--ink-faint);">Code: ${room.room_code}</p></div>
-      ${(isAdmin||isHost) ? `<button class="icon-btn" id="manageRoomBtn" aria-label="Manage room">${ICONS.admin}</button>` : ''}
-      <button class="icon-btn" id="toggleMusic" aria-label="Focus sounds">${ICONS.music}</button>
-    </div>
-    ${room.pinned_message ? `<div class="pinned-banner"><span>📌</span><p>${esc(room.pinned_message)}</p></div>` : ''}
-    <div class="card">
-      <div style="display:flex;align-items:center;justify-content:space-between;">
-        <p style="font-size:12.5px;font-weight:600;margin:0;">🎥 Study call</p>
-        <button class="btn btn-primary btn-sm" id="startCallBtn">Start / join call</button>
-        <div id="callControls" style="display:none;gap:8px;">
-          <button class="btn btn-secondary btn-sm" id="micBtn">Mute</button>
-          <button class="btn btn-secondary btn-sm" id="camBtn">Camera off</button>
-          <button class="btn btn-danger btn-sm" id="leaveCallBtn">Leave call</button>
+    <div class="room-dark">
+      <div class="rd-header">
+        <button class="rd-icon-btn" id="backToRooms">${ICONS.back}</button>
+        <div class="rd-title">
+          <p class="rd-name"><span class="rd-live-dot"></span>${esc(room.name)} ${room.is_premium?`<span class="rd-vip-pill">${ICONS.crown} VIP</span>`:''}${room.locked?`<span class="rd-locked-pill">🔒 Locked</span>`:''}</p>
+          <p class="rd-sub">Room #${room.room_code} · ${members.length} studying together</p>
+        </div>
+        <div class="rd-header-actions">
+          ${(isAdmin||isHost) ? `<button class="rd-icon-btn" id="manageRoomBtn" title="Manage room">${ICONS.admin}</button>` : ''}
+          <button class="rd-leave-btn" id="leaveRoomBtn">Leave Room</button>
         </div>
       </div>
-      <div id="callTiles"></div>
-    </div>
-    <div id="musicPanel" class="card" style="display:none;">
-      <p style="font-size:12.5px;font-weight:600;margin:0 0 8px;">Focus sounds</p>
-      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
-        <button class="btn btn-secondary btn-sm" data-noise="white">White noise</button>
-        <button class="btn btn-secondary btn-sm" data-noise="pink">Rain-like</button>
-        <button class="btn btn-secondary btn-sm" data-noise="brown">Deep hum</button>
-        <button class="btn btn-secondary btn-sm" id="stopNoiseBtn">Stop</button>
+      ${room.pinned_message ? `<div class="rd-pinned"><span>📌</span><p>${esc(room.pinned_message)}</p></div>` : ''}
+      <div class="rd-body">
+        <div class="rd-main">
+          <div class="rd-tabs">
+            <button class="rd-tab" data-rtab="call">🎥 Call</button>
+            <button class="rd-tab" data-rtab="music">🎵 Music</button>
+            <button class="rd-tab" data-rtab="notes">📝 Notes</button>
+            <button class="rd-tab" data-rtab="whiteboard">🖊 Whiteboard</button>
+            <button class="rd-tab" data-rtab="tasks">✅ Tasks</button>
+          </div>
+          <div id="rdTabBody" class="rd-tab-body"></div>
+        </div>
+        <div class="rd-side">
+          <p class="rd-side-title">Room Chat</p>
+          <div id="roomMessages" class="rd-messages"></div>
+          <div class="rd-composer">
+            <textarea rows="1" id="roomInput" placeholder="Message the room..."></textarea>
+            <button class="rd-send-btn" id="roomSend">${ICONS.send}</button>
+          </div>
+        </div>
       </div>
-      <input type="range" id="noiseVolume" min="0" max="1" step="0.05" value="0.25" style="width:100%;">
-      <div style="height:1px;background:var(--hair);margin:14px 0;"></div>
-      <p style="font-size:12.5px;font-weight:600;margin:0 0 8px;">🎵 Room jukebox</p>
-      <div id="nowPlayingBox"></div>
-      <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
-        <input id="ytLinkInput" placeholder="Paste a YouTube song link..." style="flex:1;min-width:160px;border:1px solid var(--hair-strong);border-radius:9px;padding:8px 10px;font-size:14px;background:var(--paper);color:var(--ink);">
-        <button class="btn btn-primary btn-sm" id="playForRoomBtn">Play for room</button>
-      </div>
-      <p style="font-size:11px;color:var(--ink-faint);margin-top:6px;">Anyone in the room can queue a song. Everyone taps "Join & listen" to sync to it.</p>
-    </div>
-    <div id="roomMessages"></div>
-    <div class="composer">
-      <textarea rows="1" id="roomInput" placeholder="Message the room..."></textarea>
-      <button class="send-btn" id="roomSend">${ICONS.send}</button>
     </div>
   `;
   drawRoomMessages();
-  drawNowPlaying();
-  renderCallTiles();
-  el.querySelector('#backToRooms').addEventListener('click', ()=>{ stopNoise(); if (state.call.active) endCall(); state.activeRoomId = null; renderRoute(); });
+
+  el.querySelector('#backToRooms').addEventListener('click', leaveRoomView);
+  el.querySelector('#leaveRoomBtn').addEventListener('click', leaveRoomView);
+  function leaveRoomView(){ stopNoise(); if (state.call.active) endCall(); if (state.whiteboardChannel) supabase.removeChannel(state.whiteboardChannel); if (state.notesChannel) supabase.removeChannel(state.notesChannel); if (state.tasksChannel) supabase.removeChannel(state.tasksChannel); state.activeRoomId = null; renderRoute(); }
   el.querySelector('#manageRoomBtn')?.addEventListener('click', ()=>openManageRoomModal(room));
-  el.querySelector('#startCallBtn').addEventListener('click', ()=>startCall(room.id));
-  el.querySelector('#micBtn')?.addEventListener('click', e=>{ toggleMic(); e.target.textContent = state.call.micOn ? 'Mute' : 'Unmute'; });
-  el.querySelector('#camBtn')?.addEventListener('click', e=>{ toggleCam(); e.target.textContent = state.call.camOn ? 'Camera off' : 'Camera on'; });
-  el.querySelector('#leaveCallBtn')?.addEventListener('click', endCall);
-  const panel = el.querySelector('#musicPanel');
-  el.querySelector('#toggleMusic').addEventListener('click', ()=>{ panel.style.display = panel.style.display==='none' ? 'block' : 'none'; });
-  el.querySelectorAll('[data-noise]').forEach(b=>b.addEventListener('click', ()=>playNoise(b.dataset.noise)));
-  el.querySelector('#stopNoiseBtn').addEventListener('click', stopNoise);
-  el.querySelector('#noiseVolume').addEventListener('input', e=>{ if (state.noise.gain) state.noise.gain.gain.value = Number(e.target.value); });
-  el.querySelector('#playForRoomBtn').addEventListener('click', async ()=>{
-    const inp = el.querySelector('#ytLinkInput');
-    const val = inp.value.trim();
-    if (!val) return;
-    try{
-      await setNowPlaying(room.id, val);
-      inp.value = '';
-      toast('Now playing for the room');
-    }catch(err){ toast(err.message || 'Could not queue that song'); }
-  });
+
+  el.querySelectorAll('.rd-tab').forEach(b=>b.addEventListener('click', ()=>switchRoomTab(b.dataset.rtab, room)));
+  switchRoomTab(state.roomTab, room);
+
   el.querySelector('#roomSend').addEventListener('click', async ()=>{
     const inp = el.querySelector('#roomInput');
     const val = inp.value.trim();
@@ -2062,6 +2355,163 @@ async function renderRoomChat(el){
     }
   });
 }
+
+function switchRoomTab(tab, room){
+  state.roomTab = tab;
+  document.querySelectorAll('.rd-tab').forEach(b=>b.classList.toggle('active', b.dataset.rtab===tab));
+  const body = document.getElementById('rdTabBody');
+  if (!body) return;
+  if (tab==='call') renderCallTab(body, room);
+  else if (tab==='music') renderMusicTab(body, room);
+  else if (tab==='notes') renderNotesTab(body, room);
+  else if (tab==='whiteboard') renderWhiteboardTab(body, room);
+  else if (tab==='tasks') renderTasksTab(body, room);
+}
+
+function renderCallTab(body, room){
+  body.innerHTML = `
+    <div class="rd-panel">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+        <p class="rd-panel-title">🎥 Study call</p>
+        <button class="rd-btn rd-btn-primary" id="startCallBtn">Start / join call</button>
+        <div id="callControls" style="display:none;gap:8px;">
+          <button class="rd-btn" id="micBtn">Mute</button>
+          <button class="rd-btn" id="camBtn">Camera off</button>
+          <button class="rd-btn rd-btn-danger" id="leaveCallBtn">Leave call</button>
+        </div>
+      </div>
+      <div id="callTiles"></div>
+    </div>
+  `;
+  renderCallTiles();
+  body.querySelector('#startCallBtn').addEventListener('click', ()=>startCall(room.id));
+  body.querySelector('#micBtn')?.addEventListener('click', e=>{ toggleMic(); e.target.textContent = state.call.micOn ? 'Mute' : 'Unmute'; });
+  body.querySelector('#camBtn')?.addEventListener('click', e=>{ toggleCam(); e.target.textContent = state.call.camOn ? 'Camera off' : 'Camera on'; });
+  body.querySelector('#leaveCallBtn')?.addEventListener('click', endCall);
+}
+
+function renderMusicTab(body, room){
+  body.innerHTML = `
+    <div class="rd-panel">
+      <p class="rd-panel-title">Focus sounds</p>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+        <button class="rd-btn" data-noise="white">White noise</button>
+        <button class="rd-btn" data-noise="pink">Rain-like</button>
+        <button class="rd-btn" data-noise="brown">Deep hum</button>
+        <button class="rd-btn" id="stopNoiseBtn">Stop</button>
+      </div>
+      <input type="range" id="noiseVolume" min="0" max="1" step="0.05" value="0.25" style="width:100%;">
+    </div>
+    <div class="rd-panel">
+      <p class="rd-panel-title">🎵 Room jukebox</p>
+      <div id="nowPlayingBox"></div>
+      <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
+        <input id="ytLinkInput" class="rd-input" placeholder="Paste a YouTube song link..." style="flex:1;min-width:160px;">
+        <button class="rd-btn rd-btn-primary" id="playForRoomBtn">Play for room</button>
+      </div>
+      <p style="font-size:11px;color:var(--rd-muted);margin-top:6px;">Anyone in the room can queue a song. Everyone taps "Join &amp; listen" to sync to it.</p>
+    </div>
+  `;
+  drawNowPlaying();
+  body.querySelectorAll('[data-noise]').forEach(b=>b.addEventListener('click', ()=>playNoise(b.dataset.noise)));
+  body.querySelector('#stopNoiseBtn').addEventListener('click', stopNoise);
+  body.querySelector('#noiseVolume').addEventListener('input', e=>{ if (state.noise.gain) state.noise.gain.gain.value = Number(e.target.value); });
+  body.querySelector('#playForRoomBtn').addEventListener('click', async ()=>{
+    const inp = body.querySelector('#ytLinkInput');
+    const val = inp.value.trim();
+    if (!val) return;
+    try{ await setNowPlaying(room.id, val); inp.value = ''; toast('Now playing for the room'); }
+    catch(err){ toast(err.message || 'Could not queue that song'); }
+  });
+}
+
+async function renderNotesTab(body, room){
+  body.innerHTML = `
+    <div class="rd-panel" style="height:100%;display:flex;flex-direction:column;">
+      <p class="rd-panel-title">📝 Shared notes — everyone in the room can edit</p>
+      <textarea id="roomNotesArea" class="rd-notes-area" placeholder="Start typing notes together..."></textarea>
+      <p id="notesSavedHint" style="font-size:11px;color:var(--rd-muted);margin-top:6px;">Saved automatically</p>
+    </div>
+  `;
+  const textarea = body.querySelector('#roomNotesArea');
+  textarea.value = await loadRoomNotesText(room.id);
+  subscribeRoomNotes(room.id, textarea);
+  textarea.addEventListener('input', ()=>{
+    document.getElementById('notesSavedHint').textContent = 'Saving...';
+    clearTimeout(notesSaveTimer);
+    notesSaveTimer = setTimeout(async ()=>{
+      await saveRoomNotesText(room.id, textarea.value);
+      const hint = document.getElementById('notesSavedHint');
+      if (hint) hint.textContent = 'Saved';
+    }, 700);
+  });
+}
+
+async function renderWhiteboardTab(body, room){
+  body.innerHTML = `
+    <div class="rd-panel" style="padding:10px;">
+      <div class="rd-wb-toolbar">
+        ${['#33E0FF','#B084F7','#FF5C8A','#FFD166','#5CFFB0','#FFFFFF'].map(c=>`<button class="rd-wb-color" data-color="${c}" style="background:${c};"></button>`).join('')}
+        <input type="range" id="wbSize" min="1" max="12" value="3" style="width:70px;">
+        <button class="rd-btn" id="wbEraser">Eraser</button>
+        <button class="rd-btn rd-btn-danger" id="wbClear">Clear board</button>
+      </div>
+      <canvas id="whiteboardCanvas" width="900" height="480" class="rd-whiteboard"></canvas>
+    </div>
+  `;
+  const canvas = body.querySelector('#whiteboardCanvas');
+  const strokes = await loadWhiteboardStrokes(room.id);
+  strokes.forEach(s=>drawStrokeOnCanvas(canvas, s));
+  subscribeWhiteboard(room.id, canvas);
+  setupWhiteboardCanvas(canvas, room.id);
+  body.querySelectorAll('[data-color]').forEach(b=>b.addEventListener('click', ()=>{
+    state.whiteboard.color = b.dataset.color;
+    state.whiteboard.erasing = false;
+    body.querySelectorAll('[data-color]').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+  }));
+  body.querySelector('#wbSize').addEventListener('input', e=>{ state.whiteboard.size = Number(e.target.value); });
+  body.querySelector('#wbEraser').addEventListener('click', e=>{ state.whiteboard.erasing = !state.whiteboard.erasing; e.target.classList.toggle('active', state.whiteboard.erasing); });
+  body.querySelector('#wbClear').addEventListener('click', async ()=>{ await clearWhiteboard(room.id); });
+}
+
+async function renderTasksTab(body, room){
+  state.roomTasks = await loadRoomTasks(room.id);
+  subscribeRoomTasks(room.id, ()=>drawTasksList(body));
+  body.innerHTML = `
+    <div class="rd-panel">
+      <p class="rd-panel-title">✅ Study tasks</p>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <input id="newTaskInput" class="rd-input" placeholder="Add a task, e.g. Finish Chapter 4" style="flex:1;">
+        <button class="rd-btn rd-btn-primary" id="addTaskBtn">Add</button>
+      </div>
+      <div id="tasksList"></div>
+    </div>
+  `;
+  drawTasksList(body);
+  body.querySelector('#addTaskBtn').addEventListener('click', async ()=>{
+    const inp = body.querySelector('#newTaskInput');
+    const val = inp.value.trim();
+    if (!val) return;
+    inp.value = '';
+    try{ await addRoomTask(room.id, val); }catch(e){ toast('Could not add task'); }
+  });
+}
+function drawTasksList(body){
+  const wrap = body.querySelector('#tasksList');
+  if (!wrap) return;
+  wrap.innerHTML = state.roomTasks.length ? state.roomTasks.map(t=>`
+    <div class="rd-task-row">
+      <label style="display:flex;align-items:center;gap:8px;flex:1;cursor:pointer;">
+        <input type="checkbox" data-toggle-task="${t.id}" ${t.is_done?'checked':''}>
+        <span style="${t.is_done?'text-decoration:line-through;color:var(--rd-muted);':''}">${esc(t.content)}</span>
+      </label>
+      <button class="rd-icon-btn small" data-del-task="${t.id}">${ICONS.x}</button>
+    </div>`).join('') : `<p style="font-size:12.5px;color:var(--rd-muted);">No tasks yet — add one above.</p>`;
+  wrap.querySelectorAll('[data-toggle-task]').forEach(cb=>cb.addEventListener('change', e=>toggleRoomTask(e.target.dataset.toggleTask, e.target.checked)));
+  wrap.querySelectorAll('[data-del-task]').forEach(b=>b.addEventListener('click', ()=>deleteRoomTask(b.dataset.delTask)));
+}
+
 function drawRoomMessages(){
   const wrap = document.getElementById('roomMessages');
   if (!wrap) return;
