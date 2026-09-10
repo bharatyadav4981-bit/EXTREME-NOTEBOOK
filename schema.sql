@@ -629,6 +629,25 @@ create policy "users can delete their own uploaded files"
 alter table study_rooms add column if not exists locked boolean not null default false;
 alter table study_room_members add column if not exists co_host boolean not null default false;
 
+-- BUG FIX: study_room_members has row-level security enabled (see
+-- "alter table study_room_members enable row level security" above), but
+-- there was never an UPDATE policy for it — only select/insert/delete
+-- policies exist. With RLS on and no UPDATE policy, Postgres silently
+-- matches zero rows on every update (no error is raised), which is exactly
+-- why "Make co-host" in the room-management modal appeared to do nothing:
+-- the app's update request succeeded, but the database quietly refused to
+-- change anything. This policy lets the room's host (or a platform admin)
+-- actually update a member's row — needed for the co-host toggle to work.
+create policy "room host or admin can update a member's row" on study_room_members for update
+  using (
+    exists (select 1 from study_rooms r where r.id = study_room_members.room_id and r.created_by = auth.uid())
+    or exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin')
+  )
+  with check (
+    exists (select 1 from study_rooms r where r.id = study_room_members.room_id and r.created_by = auth.uid())
+    or exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin')
+  );
+
 create table if not exists study_room_bans (
   room_id uuid references study_rooms(id) on delete cascade,
   user_id uuid references profiles(id) on delete cascade,
@@ -728,6 +747,62 @@ begin
   end;
   begin
     alter publication supabase_realtime add table study_room_notes;
+  exception when duplicate_object then null;
+  end;
+end $$;
+
+-- ============================================================
+-- FRIEND REQUESTS — private chat now requires an accepted friend
+-- request before two people can message each other.
+-- ============================================================
+create table if not exists friend_requests (
+  id uuid primary key default gen_random_uuid(),
+  from_id uuid references profiles(id) on delete cascade,
+  to_id uuid references profiles(id) on delete cascade,
+  status text not null default 'pending', -- pending | accepted | rejected
+  created_at timestamptz not null default now(),
+  resolved_at timestamptz,
+  unique(from_id, to_id)
+);
+alter table friend_requests enable row level security;
+
+drop policy if exists "involved users can read their friend requests" on friend_requests;
+create policy "involved users can read their friend requests" on friend_requests for select
+  using (auth.uid() = from_id or auth.uid() = to_id);
+
+drop policy if exists "users can send a friend request" on friend_requests;
+create policy "users can send a friend request" on friend_requests for insert
+  with check (auth.uid() = from_id and from_id <> to_id);
+
+drop policy if exists "recipient can accept or reject" on friend_requests;
+create policy "recipient can accept or reject" on friend_requests for update
+  using (auth.uid() = to_id or auth.uid() = from_id);
+
+drop policy if exists "sender can cancel their request" on friend_requests;
+create policy "sender can cancel their request" on friend_requests for delete
+  using (auth.uid() = from_id);
+
+-- a private conversation can now only be created once there is an accepted
+-- friend request between the two people (in either direction), or if either
+-- side is an admin (support/moderation can still reach anyone).
+drop policy if exists "authenticated users can start a conversation" on conversations;
+create policy "authenticated users can start a conversation" on conversations for insert
+  with check (
+    (auth.uid() = user_a or auth.uid() = user_b)
+    and (
+      exists (select 1 from profiles p where p.id = auth.uid() and p.role = 'admin')
+      or exists (
+        select 1 from friend_requests f
+        where f.status = 'accepted'
+        and ((f.from_id = user_a and f.to_id = user_b) or (f.from_id = user_b and f.to_id = user_a))
+      )
+    )
+  );
+
+do $$
+begin
+  begin
+    alter publication supabase_realtime add table friend_requests;
   exception when duplicate_object then null;
   end;
 end $$;

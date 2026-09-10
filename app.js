@@ -1,5 +1,5 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
-import { SUPABASE_URL, SUPABASE_ANON_KEY, STRIPE_PAYMENT_LINK } from './config.js';
+import { SUPABASE_URL, SUPABASE_ANON_KEY, PAYMENT_LINK } from './config.js';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const configured = !SUPABASE_URL.includes('YOUR-PROJECT');
@@ -112,10 +112,14 @@ function chatBubblesHTML(messages, myId, { idKey }){
     const name = m.profiles?.name || m.profiles?.username || 'Someone';
     html += `<div class="bubble-row ${self?'self':''} ${m.pending?'pending':''}">
       <div class="avatar sm" ${self?'':`data-viewprofile="${m[idKey]}" style="cursor:pointer;background:none;"`} style="${self?'background:var(--amber);color:#241C05;':'cursor:pointer;'}">${avatarInner(m.profiles)}</div>
-      <div>${!self?`<p class="bubble-name" data-viewprofile="${m[idKey]}" style="cursor:pointer;">${esc(name)}${roleBadge(m.profiles)}</p>`:''}<div class="bubble">${esc(m.content)}<span class="bubble-time">${m.pending?'Sending…':fmtTime(m.created_at)}</span></div></div>
+      <div>${!self?`<p class="bubble-name" data-viewprofile="${m[idKey]}" style="cursor:pointer;">${esc(name)}${roleBadge(m.profiles)}</p>`:''}<div class="bubble">${linkifyMessage(m.content)}<span class="bubble-time">${m.pending?'Sending…':fmtTime(m.created_at)}</span></div></div>
     </div>`;
   });
   return html;
+}
+function linkifyMessage(content){
+  const escaped = esc(content);
+  return escaped.replace(/(https?:\/\/[^\s]+)/g, url => `<a href="${url}" target="_blank" rel="noopener" class="rd-file-link">🔗 Open attachment</a>`);
 }
 async function sha256(str){
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
@@ -143,8 +147,8 @@ const state = {
   nowPlaying: null,
   nowPlayingChannel: null,
   noise: { ctx:null, source:null, gain:null, playing:false, type:'white' },
-  call: { active:false, roomId:null, localStream:null, peers:{}, channel:null, micOn:true, camOn:true },
-  roomTab: 'call',
+  call: { active:false, roomId:null, jitsi:null, fullscreen:false },
+  roomTab: 'notes',
   whiteboard: { color:'#33E0FF', size:3, erasing:false },
   whiteboardChannel: null,
   notesChannel: null,
@@ -346,7 +350,12 @@ async function loadAllRoomMembers(roomId){
   return data || [];
 }
 async function setCoHost(roomId, userId, value){
-  await supabase.from('study_room_members').update({ co_host: value }).eq('room_id', roomId).eq('user_id', userId);
+  const { data, error } = await supabase.from('study_room_members').update({ co_host: value }).eq('room_id', roomId).eq('user_id', userId).select();
+  if (error) throw error;
+  // With row-level security on, a blocked update returns no error and no
+  // rows — which is exactly the silent failure this used to have. Surface
+  // it instead of pretending it worked.
+  if (!data || !data.length) throw new Error('Could not update co-host — make sure the latest schema.sql has been run (co-host RLS policy).');
 }
 async function removeMember(roomId, userId){
   await supabase.from('study_room_members').delete().eq('room_id', roomId).eq('user_id', userId);
@@ -358,13 +367,71 @@ async function banMember(roomId, userId){
 async function toggleRoomLock(roomId, locked){
   await supabase.from('study_rooms').update({ locked }).eq('id', roomId);
 }
-function requestMuteFromHost(targetUserId){
-  if (!state.call.channel){ toast('Start the call first'); return; }
-  state.call.channel.send({ type:'broadcast', event:'mute-request', payload:{ target: targetUserId, from: state.session.user.id } });
-  toast('Asked them to mute their mic');
+
+/* ---- Study call via Jitsi Meet ----
+   The earlier version of this rolled a custom peer-to-peer WebRTC mesh with
+   only a free public STUN/TURN server. That works on friendly networks but
+   is genuinely unreliable across mixed networks (mobile data + Wi-Fi +
+   hotspot) — the public relay gets overloaded and connections silently die.
+   Getting that "just works everywhere" reliability really does need real
+   infrastructure, which Jitsi Meet's free public server already provides
+   (proper TURN/media-relay servers, tested at huge scale). Embedding their
+   room here needs no signup, no API key, and no backend of ours at all —
+   every member of a study room who opens the call lands in the same Jitsi
+   room and can see/hear everyone else in it. */
+function loadJitsiScript(){
+  return new Promise((resolve, reject) => {
+    if (window.JitsiMeetExternalAPI) return resolve();
+    const existing = document.getElementById('jitsi-external-api');
+    if (existing){ existing.addEventListener('load', resolve); existing.addEventListener('error', reject); return; }
+    const s = document.createElement('script');
+    s.id = 'jitsi-external-api';
+    s.src = 'https://meet.jit.si/external_api.js';
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('Could not reach the video call service — check your internet connection'));
+    document.head.appendChild(s);
+  });
+}
+async function startCall(roomId, room){
+  const container = document.getElementById('jitsiContainer');
+  if (!container) return;
+  try{
+    await loadJitsiScript();
+  }catch(err){ toast(err.message); return; }
+  if (state.call.jitsi){ try{ state.call.jitsi.dispose(); }catch(e){} }
+  container.innerHTML = '';
+  // Namespaced so it never collides with someone else's random public
+  // meet.jit.si room, and stable per study-room so returning members land
+  // in the same call.
+  const roomName = `ExtremeNotebookStudyRoom-${room.room_code}-${roomId.slice(0,8)}`;
+  state.call.jitsi = new window.JitsiMeetExternalAPI('meet.jit.si', {
+    roomName,
+    parentNode: container,
+    width: '100%',
+    height: '100%',
+    userInfo: { displayName: state.profile?.name || state.profile?.username || 'Student' },
+    configOverwrite: { prejoinPageEnabled: false, disableDeepLinking: true, startWithVideoMuted: false, startWithAudioMuted: false },
+    interfaceConfigOverwrite: { SHOW_JITSI_WATERMARK: false, SHOW_WATERMARK_FOR_GUESTS: false, MOBILE_APP_PROMO: false },
+  });
+  state.call.active = true;
+  state.call.roomId = roomId;
+  state.call.jitsi.addEventListener('videoConferenceLeft', () => { endCall(); });
+  renderCallButtons();
+}
+function endCall(){
+  if (state.call.jitsi){ try{ state.call.jitsi.dispose(); }catch(e){} state.call.jitsi = null; }
+  const container = document.getElementById('jitsiContainer');
+  if (container) container.innerHTML = '';
+  state.call.active = false;
+  renderCallButtons();
+}
+function renderCallButtons(){
+  const startBtn = document.getElementById('startCallBtn');
+  const leaveBtn = document.getElementById('leaveCallBtn');
+  if (startBtn) startBtn.style.display = state.call.active ? 'none' : 'inline-flex';
+  if (leaveBtn) leaveBtn.style.display = state.call.active ? 'inline-flex' : 'none';
 }
 
-/* ---- Shared whiteboard (canvas strokes synced over Realtime) ---- */
 async function loadWhiteboardStrokes(roomId){
   const { data } = await supabase.from('study_room_whiteboard_strokes').select('*').eq('room_id', roomId).order('created_at');
   return data || [];
@@ -697,11 +764,56 @@ async function loadConversations(){
   enriched.sort((a,b)=> new Date(b.last?.created_at || b.created_at) - new Date(a.last?.created_at || a.created_at));
   state.conversations = enriched;
 }
+async function sendFriendRequest(toId){
+  const { error } = await supabase.from('friend_requests').insert({ from_id: state.session.user.id, to_id: toId, status:'pending' });
+  if (error) throw error;
+}
+async function respondFriendRequest(requestId, accept){
+  await supabase.from('friend_requests').update({ status: accept?'accepted':'rejected', resolved_at: new Date().toISOString() }).eq('id', requestId);
+}
+async function loadIncomingFriendRequests(){
+  if (!state.session) return [];
+  const { data } = await supabase.from('friend_requests').select('*, profiles!friend_requests_from_id_fkey(username,name,avatar_url)').eq('to_id', state.session.user.id).eq('status','pending').order('created_at',{ ascending:false });
+  return data || [];
+}
+// Messaging someone new now goes through a friend request first (like a
+// social app) — once accepted, the private conversation opens as normal.
 async function startConversationWithUsername(username){
   const { data: target } = await supabase.from('profiles').select('id,username,name,avatar_url,role').eq('username', username).single();
   if (!target) throw new Error('No user found with that username');
   if (target.id === state.session.user.id) throw new Error("You can't message yourself");
-  const [a,b] = [state.session.user.id, target.id].sort();
+  const myId = state.session.user.id;
+  const isAdmin = state.profile.role === 'admin';
+
+  if (!isAdmin){
+    const { data: existingReq } = await supabase.from('friend_requests').select('*')
+      .or(`and(from_id.eq.${myId},to_id.eq.${target.id}),and(from_id.eq.${target.id},to_id.eq.${myId})`)
+      .maybeSingle();
+
+    if (!existingReq){
+      await sendFriendRequest(target.id);
+      const err = new Error(`Friend request sent to ${target.name||target.username}. You'll be able to chat once they accept.`);
+      err.friendRequestSent = true;
+      throw err;
+    }
+    if (existingReq.status === 'pending'){
+      if (existingReq.from_id === target.id){
+        await respondFriendRequest(existingReq.id, true);
+      } else {
+        const err = new Error('Friend request already sent — waiting for them to accept.');
+        err.friendRequestPending = true;
+        throw err;
+      }
+    } else if (existingReq.status === 'rejected'){
+      await supabase.from('friend_requests').delete().eq('id', existingReq.id);
+      await sendFriendRequest(target.id);
+      const err = new Error(`Friend request sent to ${target.name||target.username}.`);
+      err.friendRequestSent = true;
+      throw err;
+    }
+  }
+
+  const [a,b] = [myId, target.id].sort();
   const { data: existing } = await supabase.from('conversations').select('*').eq('user_a', a).eq('user_b', b).maybeSingle();
   if (existing) return existing.id;
   const { data: created, error } = await supabase.from('conversations').insert({ user_a:a, user_b:b }).select().single();
@@ -964,6 +1076,7 @@ async function renderHome(){
     <div class="grid-4" style="margin-bottom:20px;">
       <div class="tile subject-card" data-nav="test"><div class="tile-icon" style="background:var(--paper);font-size:20px;">${ICONS.clipboard}</div><div class="subject-info"><p class="tile-name">Test</p><p class="tile-meta">Practice</p></div></div>
       <div class="tile subject-card" data-nav="livetest"><div class="tile-icon" style="background:var(--paper);font-size:20px;">${ICONS.timer}</div><div class="subject-info"><p class="tile-name">Live Test</p><p class="tile-meta">Hosted by admin</p></div></div>
+      <div class="tile subject-card" data-nav="rooms"><div class="tile-icon" style="background:var(--paper);font-size:20px;">${ICONS.rooms}</div><div class="subject-info"><p class="tile-name">Study Rooms</p><p class="tile-meta">Study with friends</p></div></div>
     </div>
     <div class="section-head"><h2>Subjects</h2><a href="#" data-nav="study">View all</a></div>
     <div class="grid-4" id="homeSubjects"></div>
@@ -1234,6 +1347,34 @@ async function renderPrivate(){
   `;
   bindChatTabs(el);
   const body = el.querySelector('#privateBody');
+  if (!state.privateHidden){
+    const incoming = await loadIncomingFriendRequests();
+    if (incoming.length){
+      const banner = document.createElement('div');
+      banner.className = 'card';
+      banner.innerHTML = `
+        <p style="font-size:12.5px;font-weight:600;margin:0 0 8px;">Friend requests</p>
+        ${incoming.map(r=>`
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--hair);">
+            <span style="font-size:13px;">${esc(r.profiles?.name || r.profiles?.username || 'Someone')}</span>
+            <span style="display:flex;gap:6px;">
+              <button class="btn btn-secondary btn-sm" data-decline-fr="${r.id}">Decline</button>
+              <button class="btn btn-primary btn-sm" data-accept-fr="${r.id}">Accept</button>
+            </span>
+          </div>`).join('')}
+      `;
+      body.before(banner);
+      banner.querySelectorAll('[data-accept-fr]').forEach(b=>b.addEventListener('click', async ()=>{
+        await respondFriendRequest(b.dataset.acceptFr, true);
+        toast('Friend request accepted — you can chat now');
+        renderRoute();
+      }));
+      banner.querySelectorAll('[data-decline-fr]').forEach(b=>b.addEventListener('click', async ()=>{
+        await respondFriendRequest(b.dataset.declineFr, false);
+        renderRoute();
+      }));
+    }
+  }
   if (state.privateHidden){
     // Deliberately indistinguishable from a genuinely empty inbox — no hint that anything is hidden.
     body.innerHTML = `<div class="empty"><p>No conversations yet. Tap + to start one.</p></div>`;
@@ -1310,12 +1451,18 @@ function openNewConvoModal(){
 async function renderThread(el){
   const c = state.conversations.find(x=>x.id===state.openConvoId);
   if (!c){ state.openConvoId = null; return renderPrivate(); }
+  const myId = state.session.user.id;
+  const isAdmin = state.profile?.role === 'admin';
+  const myRooms = state.rooms.filter(r => isAdmin || r.created_by === myId);
   el.innerHTML = `
     <div class="thread-header">
       <button class="back" id="backToConvos">${ICONS.back}</button>
       <div class="avatar-wrap" data-viewprofile="${c.other.id}" style="cursor:pointer;"><div class="avatar sm" style="overflow:hidden;">${avatarInner(c.other)}</div></div>
       <div class="info" data-viewprofile="${c.other.id}" style="cursor:pointer;"><p class="name">${esc(c.other.name||c.other.username)}${roleBadge(c.other)}</p></div>
-      <div class="thread-actions"><button class="icon-btn small danger" id="stopPrivate" aria-label="Delete conversation">${ICONS.stop}</button></div>
+      <div class="thread-actions">
+        ${myRooms.length ? `<button class="icon-btn small" id="inviteToRoomBtn" aria-label="Invite to a study room">${ICONS.rooms}</button>` : ''}
+        <button class="icon-btn small danger" id="stopPrivate" aria-label="Delete conversation">${ICONS.stop}</button>
+      </div>
     </div>
     <div id="threadMessages"></div>
     <div class="composer">
@@ -1326,6 +1473,23 @@ async function renderThread(el){
   drawThreadMessages();
   el.querySelector('#backToConvos').addEventListener('click', ()=>{ state.openConvoId=null; renderRoute(); });
   el.querySelectorAll('[data-viewprofile]').forEach(node=>node.addEventListener('click', ()=>openUserProfileModal(c.other.id)));
+  el.querySelector('#inviteToRoomBtn')?.addEventListener('click', ()=>{
+    openModal(`
+      <div class="modal">
+        <h3>Invite ${esc(c.other.name||c.other.username)} to a room</h3>
+        <p>Pick one of your study rooms — they'll be added for free right away.</p>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          ${myRooms.map(r=>`<button class="btn btn-secondary" data-invite-room="${r.id}" style="justify-content:space-between;">${esc(r.name)} <span style="color:var(--ink-faint);">#${r.room_code}</span></button>`).join('')}
+        </div>
+        <div class="modal-actions"><button class="btn btn-secondary" id="cancelInviteRoom" style="width:100%;justify-content:center;">Close</button></div>
+      </div>
+    `);
+    document.getElementById('cancelInviteRoom').addEventListener('click', closeModal);
+    document.querySelectorAll('[data-invite-room]').forEach(b=>b.addEventListener('click', async ()=>{
+      try{ await inviteUserToRoom(b.dataset.inviteRoom, c.other.username); toast('Invited to the room for free'); closeModal(); }
+      catch(err){ toast(err.message); }
+    }));
+  });
   el.querySelector('#stopPrivate').addEventListener('click', ()=>{ state.stopConfirm = { type:'private', convoId:c.id }; renderStopModal(); });
   el.querySelector('#privSend').addEventListener('click', async ()=>{
     const inp = el.querySelector('#privInput');
@@ -1700,7 +1864,7 @@ function openUpgradeModal(){
   openModal(`
     <div class="modal">
       <h3>Upgrade to premium</h3>
-      <p>Unlock premium notes and support the platform. Payment is handled securely by Stripe.</p>
+      <p>Unlock premium notes and support the platform.</p>
       <div class="modal-actions">
         <button class="btn btn-secondary" id="cancelUpgrade">Not now</button>
         <button class="btn btn-primary" id="goStripe">${ICONS.crown} Continue to payment</button>
@@ -1709,12 +1873,16 @@ function openUpgradeModal(){
   `);
   document.getElementById('cancelUpgrade').addEventListener('click', closeModal);
   document.getElementById('goStripe').addEventListener('click', async ()=>{
-    if (!STRIPE_PAYMENT_LINK){
-      toast('Payments are not set up yet — see SETUP_GUIDE.md, step 6');
+    if (!PAYMENT_LINK){
+      toast('Payments are not set up yet — see SETUP_GUIDE.md, step 8');
       return;
     }
     await supabase.from('subscriptions').insert({ user_id: state.session.user.id, plan:'premium', status:'pending' });
-    const url = `${STRIPE_PAYMENT_LINK}?client_reference_id=${state.session.user.id}`;
+    // client_reference_id is only understood by Stripe Payment Links — most
+    // other providers just ignore an unknown query param, so this is safe to
+    // leave in either way. It's the one part of this flow that ties the
+    // payment back to this specific user without a server.
+    const url = `${PAYMENT_LINK}?client_reference_id=${state.session.user.id}`;
     window.open(url, '_blank');
     closeModal();
   });
@@ -1887,126 +2055,6 @@ function stopNoise(){
   state.noise.playing = false;
 }
 
-/* ---- Room video/audio call (peer-to-peer WebRTC, signaled via Supabase Realtime broadcast) ----
-   No media server involved — each participant connects directly to every other
-   participant ("mesh"). This works well for a small group studying together
-   (a handful of people); it isn't meant for large rooms since every extra
-   person adds a direct connection for everyone else. */
-function rtcConfig(){ return { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }; }
-function createPeerConnection(peerId){
-  const pc = new RTCPeerConnection(rtcConfig());
-  state.call.localStream?.getTracks().forEach(track => pc.addTrack(track, state.call.localStream));
-  pc.onicecandidate = e => {
-    if (e.candidate) state.call.channel?.send({ type:'broadcast', event:'ice', payload:{ from: state.session.user.id, to: peerId, candidate: e.candidate } });
-  };
-  pc.ontrack = e => {
-    if (state.call.peers[peerId]) state.call.peers[peerId].stream = e.streams[0];
-    renderCallTiles();
-  };
-  pc.onconnectionstatechange = () => {
-    if (['disconnected','failed','closed'].includes(pc.connectionState)) removeCallPeer(peerId);
-  };
-  return pc;
-}
-function removeCallPeer(peerId){
-  const entry = state.call.peers[peerId];
-  if (entry){ try{ entry.pc.close(); }catch(e){} delete state.call.peers[peerId]; renderCallTiles(); }
-}
-async function startCall(roomId){
-  try{
-    state.call.localStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
-  }catch(err){
-    toast('Could not access camera/microphone — check browser permissions');
-    return;
-  }
-  state.call.active = true;
-  state.call.roomId = roomId;
-  state.call.peers = {};
-  const myId = state.session.user.id;
-  const myName = state.profile.name || state.profile.username;
-  const channel = supabase.channel('call-'+roomId, { config: { broadcast: { self:false } } });
-  channel.on('broadcast', { event:'join' }, async ({ payload }) => {
-    if (payload.userId === myId || state.call.peers[payload.userId]) return;
-    const pc = createPeerConnection(payload.userId);
-    state.call.peers[payload.userId] = { pc, name: payload.name, stream:null };
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    channel.send({ type:'broadcast', event:'offer', payload:{ from:myId, to:payload.userId, name:myName, sdp:offer } });
-    renderCallTiles();
-  });
-  channel.on('broadcast', { event:'offer' }, async ({ payload }) => {
-    if (payload.to !== myId) return;
-    let entry = state.call.peers[payload.from];
-    if (!entry){ entry = { pc: createPeerConnection(payload.from), name: payload.name, stream:null }; state.call.peers[payload.from] = entry; }
-    await entry.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-    const answer = await entry.pc.createAnswer();
-    await entry.pc.setLocalDescription(answer);
-    channel.send({ type:'broadcast', event:'answer', payload:{ from:myId, to:payload.from, name:myName, sdp:answer } });
-    renderCallTiles();
-  });
-  channel.on('broadcast', { event:'answer' }, async ({ payload }) => {
-    if (payload.to !== myId) return;
-    const entry = state.call.peers[payload.from];
-    if (entry) await entry.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-  });
-  channel.on('broadcast', { event:'ice' }, async ({ payload }) => {
-    if (payload.to !== myId) return;
-    const entry = state.call.peers[payload.from];
-    if (entry && payload.candidate){ try{ await entry.pc.addIceCandidate(new RTCIceCandidate(payload.candidate)); }catch(e){} }
-  });
-  channel.on('broadcast', { event:'leave' }, ({ payload }) => { removeCallPeer(payload.userId); });
-  channel.on('broadcast', { event:'mute-request' }, ({ payload }) => {
-    if (payload.target === myId && state.call.micOn){ toggleMic(); toast('The host asked you to mute your mic'); }
-  });
-  channel.subscribe(status => {
-    if (status === 'SUBSCRIBED') channel.send({ type:'broadcast', event:'join', payload:{ userId: myId, name: myName } });
-  });
-  state.call.channel = channel;
-  renderCallTiles();
-}
-function endCall(){
-  if (state.call.channel){
-    try{ state.call.channel.send({ type:'broadcast', event:'leave', payload:{ userId: state.session.user.id } }); }catch(e){}
-    supabase.removeChannel(state.call.channel);
-  }
-  Object.values(state.call.peers).forEach(p=>{ try{ p.pc.close(); }catch(e){} });
-  state.call.peers = {};
-  state.call.localStream?.getTracks().forEach(t=>t.stop());
-  state.call.localStream = null;
-  state.call.channel = null;
-  state.call.active = false;
-  renderCallTiles();
-}
-function toggleMic(){
-  state.call.micOn = !state.call.micOn;
-  state.call.localStream?.getAudioTracks().forEach(t => t.enabled = state.call.micOn);
-  renderCallTiles();
-}
-function toggleCam(){
-  state.call.camOn = !state.call.camOn;
-  state.call.localStream?.getVideoTracks().forEach(t => t.enabled = state.call.camOn);
-  renderCallTiles();
-}
-function renderCallTiles(){
-  const wrap = document.getElementById('callTiles');
-  const startBtn = document.getElementById('startCallBtn');
-  const controls = document.getElementById('callControls');
-  if (startBtn) startBtn.style.display = state.call.active ? 'none' : 'inline-flex';
-  if (controls) controls.style.display = state.call.active ? 'flex' : 'none';
-  if (!wrap) return;
-  if (!state.call.active){ wrap.innerHTML = ''; return; }
-  const tiles = [`<div class="call-tile"><video autoplay muted playsinline id="localCallVideo"></video><span class="call-tile-name">You</span></div>`];
-  Object.entries(state.call.peers).forEach(([id, p])=>{
-    tiles.push(`<div class="call-tile"><video autoplay playsinline id="peer-video-${id}"></video><span class="call-tile-name">${esc(p.name||'Peer')}</span></div>`);
-  });
-  wrap.innerHTML = `<div class="call-grid">${tiles.join('')}</div>`;
-  const localVideo = document.getElementById('localCallVideo');
-  if (localVideo && state.call.localStream) localVideo.srcObject = state.call.localStream;
-  Object.entries(state.call.peers).forEach(([id, p])=>{
-    const v = document.getElementById('peer-video-'+id);
-    if (v && p.stream) v.srcObject = p.stream;
-  });
-}
 
 /* ---- Study Rooms ---- */
 async function renderRooms(){
@@ -2178,7 +2226,6 @@ async function openManageRoomModal(room){
           return `<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;padding:6px 0;border-bottom:1px solid var(--hair);flex-wrap:wrap;">
             <span style="font-size:13px;min-width:0;word-break:break-word;">${esc(m.profiles?.name || m.profiles?.username || 'Student')} ${isRoomHost?'<span class="tag" style="background:var(--amber-soft);color:#7A5410;">Host</span>':m.co_host?'<span class="tag">Co-Host</span>':''}</span>
             ${(!isMe && !isRoomHost) ? `<span style="display:flex;gap:4px;flex-shrink:0;flex-wrap:wrap;">
-              <button class="btn btn-secondary btn-sm" data-mute="${m.user_id}" title="Ask to mute">🔇</button>
               <button class="btn btn-secondary btn-sm" data-cohost="${m.user_id}" data-current="${m.co_host}">${m.co_host?'Remove co-host':'Make co-host'}</button>
               <button class="btn btn-secondary btn-sm" data-remove="${m.user_id}">Remove</button>
               <button class="btn btn-danger btn-sm" data-block="${m.user_id}">Block</button>
@@ -2226,37 +2273,34 @@ async function openManageRoomModal(room){
     await toggleRoomLock(room.id, e.target.checked);
     toast(e.target.checked ? 'Room locked — no new joins' : 'Room unlocked');
   });
-  document.querySelectorAll('[data-mute]').forEach(b=>b.addEventListener('click', ()=>requestMuteFromHost(b.dataset.mute)));
   document.querySelectorAll('[data-cohost]').forEach(b=>b.addEventListener('click', async ()=>{
-    await setCoHost(room.id, b.dataset.cohost, b.dataset.current !== 'true');
-    closeModal();
+    try{
+      await setCoHost(room.id, b.dataset.cohost, b.dataset.current !== 'true');
+      toast(b.dataset.current !== 'true' ? 'Made co-host' : 'Co-host removed');
+    }catch(err){ toast(err.message || 'Could not update co-host'); }
     await openManageRoomModal(room);
   }));
   document.querySelectorAll('[data-remove]').forEach(b=>b.addEventListener('click', async ()=>{
     if (!confirm('Remove this person from the room?')) return;
     await removeMember(room.id, b.dataset.remove);
     toast('Removed from room');
-    closeModal();
     await openManageRoomModal(room);
   }));
   document.querySelectorAll('[data-block]').forEach(b=>b.addEventListener('click', async ()=>{
     if (!confirm('Block this person? They will not be able to rejoin with the room code.')) return;
     await banMember(room.id, b.dataset.block);
     toast('Blocked from room');
-    closeModal();
     await openManageRoomModal(room);
   }));
   document.querySelectorAll('[data-approve],[data-reject]').forEach(b=>b.addEventListener('click', async ()=>{
     const req = reqs.find(r=>r.id === (b.dataset.approve || b.dataset.reject));
     await resolveRoomAccessRequest(req, !!b.dataset.approve);
     toast(b.dataset.approve ? 'Access approved for 30 days' : 'Request rejected');
-    closeModal();
     await openManageRoomModal(room);
   }));
   document.querySelectorAll('[data-renew]').forEach(b=>b.addEventListener('click', async ()=>{
     await renewRoomAccess(b.dataset.renew);
     toast('Subscription renewed for 30 days');
-    closeModal();
     await openManageRoomModal(room);
   }));
   document.getElementById('mgInviteBtn').addEventListener('click', async ()=>{
@@ -2285,7 +2329,7 @@ async function renderRoomChat(el){
   const isHost = room.created_by === state.session.user.id;
   const members = await loadAllRoomMembers(room.id);
   state.roomMembersFull = members;
-  state.roomTab = state.roomTab || 'call';
+  state.roomTab = (state.roomTab && state.roomTab !== 'call') ? state.roomTab : 'notes';
 
   el.innerHTML = `
     <div class="room-dark">
@@ -2296,6 +2340,7 @@ async function renderRoomChat(el){
           <p class="rd-sub">Room #${room.room_code} · ${members.length} studying together</p>
         </div>
         <div class="rd-header-actions">
+          <span class="rd-timer" id="roomTimer" title="Time in this room">${ICONS.timer} 00:00</span>
           ${(isAdmin||isHost) ? `<button class="rd-icon-btn" id="manageRoomBtn" title="Manage room">${ICONS.admin}</button>` : ''}
           <button class="rd-leave-btn" id="leaveRoomBtn">Leave Room</button>
         </div>
@@ -2304,35 +2349,66 @@ async function renderRoomChat(el){
       <div class="rd-body">
         <div class="rd-main">
           <div class="rd-tabs">
-            <button class="rd-tab" data-rtab="call">🎥 Call</button>
-            <button class="rd-tab" data-rtab="music">🎵 Music</button>
-            <button class="rd-tab" data-rtab="notes">📝 Notes</button>
-            <button class="rd-tab" data-rtab="whiteboard">🖊 Whiteboard</button>
-            <button class="rd-tab" data-rtab="tasks">✅ Tasks</button>
+            <button class="rd-tab" data-rtab="notes"><span class="rd-tab-icon">📝</span>Notes<small>Group notes</small></button>
+            <button class="rd-tab" data-rtab="whiteboard"><span class="rd-tab-icon">🖊</span>Whiteboard<small>Draw &amp; solve</small></button>
+            <button class="rd-tab" data-rtab="music"><span class="rd-tab-icon">🎵</span>Music<small>Study sounds</small></button>
+            <button class="rd-tab" data-rtab="tasks"><span class="rd-tab-icon">✅</span>Tasks<small>Stay focused</small></button>
           </div>
           <div id="rdTabBody" class="rd-tab-body"></div>
         </div>
         <div class="rd-side">
-          <p class="rd-side-title">Room Chat</p>
-          <div id="roomMessages" class="rd-messages"></div>
-          <div class="rd-composer">
-            <textarea rows="1" id="roomInput" placeholder="Message the room..."></textarea>
-            <button class="rd-send-btn" id="roomSend">${ICONS.send}</button>
+          <div class="rd-call-strip" id="rdCallStrip"></div>
+          <div class="rd-chat-block">
+            <p class="rd-side-title">Room Chat</p>
+            <div id="roomMessages" class="rd-messages"></div>
+            <div class="rd-composer">
+              <button class="rd-file-btn" id="roomFileBtn" title="Attach a file">${ICONS.plus}</button>
+              <input type="file" id="roomFileInput" accept=".pdf,image/*,.doc,.docx,.ppt,.pptx" style="display:none;">
+              <textarea rows="1" id="roomInput" placeholder="Message the room..."></textarea>
+              <button class="rd-send-btn" id="roomSend">${ICONS.send}</button>
+            </div>
+          </div>
+          <div class="rd-participants-block">
+            <p class="rd-side-title">Participants (${members.length})</p>
+            <div id="rdParticipants"></div>
           </div>
         </div>
       </div>
     </div>
   `;
   drawRoomMessages();
+  renderCallStrip(document.getElementById('rdCallStrip'), room);
+  renderParticipantsList(members, room);
+
+  const timerEl = document.getElementById('roomTimer');
+  const roomEnteredAt = Date.now();
+  state.roomTimerInterval = setInterval(()=>{
+    if (!timerEl) return;
+    const s = Math.floor((Date.now()-roomEnteredAt)/1000);
+    const hh = Math.floor(s/3600), mm = Math.floor((s%3600)/60), ss = s%60;
+    const pad = n=>String(n).padStart(2,'0');
+    timerEl.innerHTML = `${ICONS.timer} ${hh>0 ? pad(hh)+':' : ''}${pad(mm)}:${pad(ss)}`;
+  }, 1000);
 
   el.querySelector('#backToRooms').addEventListener('click', leaveRoomView);
   el.querySelector('#leaveRoomBtn').addEventListener('click', leaveRoomView);
-  function leaveRoomView(){ stopNoise(); if (state.call.active) endCall(); if (state.whiteboardChannel) supabase.removeChannel(state.whiteboardChannel); if (state.notesChannel) supabase.removeChannel(state.notesChannel); if (state.tasksChannel) supabase.removeChannel(state.tasksChannel); state.activeRoomId = null; renderRoute(); }
+  function leaveRoomView(){ stopNoise(); if (state.call.active) endCall(); if (state.whiteboardChannel) supabase.removeChannel(state.whiteboardChannel); if (state.notesChannel) supabase.removeChannel(state.notesChannel); if (state.tasksChannel) supabase.removeChannel(state.tasksChannel); if (state.roomTimerInterval) clearInterval(state.roomTimerInterval); state.activeRoomId = null; renderRoute(); }
   el.querySelector('#manageRoomBtn')?.addEventListener('click', ()=>openManageRoomModal(room));
 
   el.querySelectorAll('.rd-tab').forEach(b=>b.addEventListener('click', ()=>switchRoomTab(b.dataset.rtab, room)));
   switchRoomTab(state.roomTab, room);
 
+  el.querySelector('#roomFileBtn').addEventListener('click', ()=>el.querySelector('#roomFileInput').click());
+  el.querySelector('#roomFileInput').addEventListener('change', async e=>{
+    const file = e.target.files[0];
+    if (!file) return;
+    toast('Uploading file...');
+    try{
+      const url = await uploadRoomFile(file);
+      await sendRoomMessage(room.id, `📎 ${file.name}\n${url}`);
+    }catch(err){ toast('Could not upload file — check the "attachments" storage bucket'); }
+    e.target.value = '';
+  });
   el.querySelector('#roomSend').addEventListener('click', async ()=>{
     const inp = el.querySelector('#roomInput');
     const val = inp.value.trim();
@@ -2355,40 +2431,71 @@ async function renderRoomChat(el){
     }
   });
 }
+function renderParticipantsList(members, room){
+  const wrap = document.getElementById('rdParticipants');
+  if (!wrap) return;
+  wrap.innerHTML = members.map(m=>{
+    const prof = m.profiles || {};
+    const inCall = m.user_id === state.session.user.id ? state.call.active : false; // presence of others in the Jitsi call isn't tracked in our own state
+    const isRoomHost = m.user_id === room.created_by;
+    return `<div class="rd-participant-row">
+      <div class="avatar" style="width:24px;height:24px;font-size:10px;">${avatarInner(prof)}</div>
+      <span>${esc(prof.name || prof.username || 'Member')}${roleBadge(prof)}</span>
+      ${inCall ? `<span class="rd-participant-live" title="In the call">${ICONS.live}</span>` : ''}
+      <span class="rd-participant-role">${isRoomHost ? 'Host' : ''}</span>
+    </div>`;
+  }).join('') || `<p style="font-size:12px;color:var(--rd-muted);margin:0;">No one here yet.</p>`;
+}
 
 function switchRoomTab(tab, room){
   state.roomTab = tab;
   document.querySelectorAll('.rd-tab').forEach(b=>b.classList.toggle('active', b.dataset.rtab===tab));
   const body = document.getElementById('rdTabBody');
   if (!body) return;
-  if (tab==='call') renderCallTab(body, room);
-  else if (tab==='music') renderMusicTab(body, room);
+  if (tab==='music') renderMusicTab(body, room);
   else if (tab==='notes') renderNotesTab(body, room);
   else if (tab==='whiteboard') renderWhiteboardTab(body, room);
   else if (tab==='tasks') renderTasksTab(body, room);
 }
 
-function renderCallTab(body, room){
+function renderCallStrip(body, room){
   body.innerHTML = `
-    <div class="rd-panel">
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+    <div class="call-panel" id="callPanelWrap">
+      <button class="call-fs-close" id="callFsClose" title="Exit full screen">${ICONS.x}</button>
+      <div class="call-panel-head">
         <p class="rd-panel-title">🎥 Study call</p>
-        <button class="rd-btn rd-btn-primary" id="startCallBtn">Start / join call</button>
-        <div id="callControls" style="display:none;gap:8px;">
-          <button class="rd-btn" id="micBtn">Mute</button>
-          <button class="rd-btn" id="camBtn">Camera off</button>
-          <button class="rd-btn rd-btn-danger" id="leaveCallBtn">Leave call</button>
-        </div>
+        <button class="rd-btn rd-btn-primary btn-sm" id="startCallBtn">Start / join</button>
+        <button class="rd-btn rd-btn-danger btn-sm" id="leaveCallBtn" style="display:none;">Leave call</button>
       </div>
-      <div id="callTiles"></div>
+      <div id="jitsiContainer" class="jitsi-container"></div>
+      <p class="rotate-hint">Tip: rotate your phone sideways for a full-screen view.</p>
     </div>
   `;
-  renderCallTiles();
-  body.querySelector('#startCallBtn').addEventListener('click', ()=>startCall(room.id));
-  body.querySelector('#micBtn')?.addEventListener('click', e=>{ toggleMic(); e.target.textContent = state.call.micOn ? 'Mute' : 'Unmute'; });
-  body.querySelector('#camBtn')?.addEventListener('click', e=>{ toggleCam(); e.target.textContent = state.call.camOn ? 'Camera off' : 'Camera on'; });
-  body.querySelector('#leaveCallBtn')?.addEventListener('click', endCall);
+  renderCallButtons();
+  body.querySelector('#startCallBtn').addEventListener('click', ()=>{
+    setCallFullscreen(true);
+    startCall(room.id, room);
+  });
+  body.querySelector('#leaveCallBtn')?.addEventListener('click', ()=>{ endCall(); setCallFullscreen(false); });
+  body.querySelector('#callFsClose')?.addEventListener('click', ()=>setCallFullscreen(false));
 }
+async function setCallFullscreen(on){
+  state.call.fullscreen = on;
+  document.documentElement.classList.toggle('call-fullscreen', on);
+  if (on){
+    try{ await document.documentElement.requestFullscreen?.(); }catch(e){}
+    try{ if (screen.orientation?.lock) await screen.orientation.lock('landscape'); }catch(e){}
+  } else {
+    try{ if (document.fullscreenElement) await document.exitFullscreen?.(); }catch(e){}
+    try{ screen.orientation?.unlock?.(); }catch(e){}
+  }
+}
+document.addEventListener('fullscreenchange', ()=>{
+  if (!document.fullscreenElement && state.call.fullscreen){
+    document.documentElement.classList.remove('call-fullscreen');
+    state.call.fullscreen = false;
+  }
+});
 
 function renderMusicTab(body, room){
   body.innerHTML = `
@@ -2512,6 +2619,14 @@ function drawTasksList(body){
   wrap.querySelectorAll('[data-del-task]').forEach(b=>b.addEventListener('click', ()=>deleteRoomTask(b.dataset.delTask)));
 }
 
+async function uploadRoomFile(file){
+  const ext = (file.name.split('.').pop() || 'pdf').toLowerCase();
+  const path = `room-files/${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`;
+  const { error } = await supabase.storage.from('attachments').upload(path, file, { upsert:true });
+  if (error) throw error;
+  const { data } = supabase.storage.from('attachments').getPublicUrl(path);
+  return data.publicUrl;
+}
 function drawRoomMessages(){
   const wrap = document.getElementById('roomMessages');
   if (!wrap) return;
@@ -2638,6 +2753,8 @@ function requireAuth(){
 /* ============ ROUTER ============ */
 async function renderRoute(){
   document.documentElement.setAttribute('data-theme', state.theme);
+  const inRoomFullscreen = state.view === 'rooms' && !!state.activeRoomId;
+  document.documentElement.classList.toggle('room-focus-mode', inRoomFullscreen);
   renderChrome();
   const views = ['home','study','notes','test','livetest','rooms','doubts','live','private','dashboard','profile','bookmarks','admin'];
   views.forEach(v=>{ const node = document.getElementById('view-'+v); if (node) node.hidden = state.view !== v; });
