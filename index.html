@@ -97,7 +97,15 @@ a{color:inherit;text-decoration:none;} button{font-family:inherit;cursor:pointer
 .bubble-row{display:flex;gap:8px;margin-bottom:12px;align-items:flex-end;} .bubble-row.self{flex-direction:row-reverse;}
 .bubble{max-width:72%;padding:10px 13px;border-radius:14px;font-size:13.5px;line-height:1.5;}
 .bubble-row:not(.self) .bubble{background:var(--paper-raised);border:1px solid var(--hair);border-bottom-left-radius:4px;}
-.bubble-row.self .bubble{background:var(--indigo);color:#fff;border-bottom-right-radius:4px;}
+.bubble-row.self .bubble{background:var(--scoped-accent, var(--indigo));color:#fff;border-bottom-right-radius:4px;}
+.chat-appearance-scope{background:var(--scoped-chat-bg, transparent);font-family:var(--scoped-font, inherit);border-radius:14px;}
+.chat-appearance-scope .bubble{border-radius:var(--scoped-bubble-radius, 14px) !important;}
+.chat-appearance-scope .bubble-row{margin-bottom:var(--scoped-msg-gap, 12px) !important;}
+.ca-swatch-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:8px;}
+.ca-swatch{display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 6px;border-radius:12px;border:2px solid var(--hair-strong);cursor:pointer;}
+.ca-swatch.active{border-color:var(--indigo);box-shadow:0 0 0 2px var(--indigo-deep);}
+.ca-swatch-dot{width:20px;height:20px;border-radius:50%;box-shadow:0 0 0 2px rgba(255,255,255,0.15);}
+.ca-swatch-label{font-size:10.5px;font-weight:600;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.6);}
 .bubble-name{font-size:11px;font-weight:600;color:var(--ink-faint);margin:0 0 2px 4px;} .bubble-time{font-size:10px;color:var(--ink-faint);margin-top:3px;display:block;}
 .bubble-row.self .bubble-time{color:rgba(255,255,255,0.65);}
 .bubble-row.pending .bubble{opacity:0.62;}
@@ -229,11 +237,51 @@ html.call-fullscreen .call-fs-close{display:flex;}
 .rd-wb-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;}
 .rd-wb-color{width:26px;height:26px;border-radius:50%;border:2px solid rgba(255,255,255,0.25);flex-shrink:0;}
 .rd-wb-color.active{border-color:#fff;box-shadow:0 0 0 2px var(--rd-cyan);}
-.rd-whiteboard{width:100%;aspect-ratio:900/480;background:#0B0F1A;border-radius:12px;border:1px solid var(--rd-border);touch-action:none;cursor:crosshair;}
+.rd-whiteboard{width:100%;aspect-ratio:1600/853;background:#0B0F1A;border-radius:12px;border:1px solid var(--rd-border);touch-action:none;cursor:crosshair;}
 .rd-task-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--rd-border);}
 .rd-task-row:last-child{border-bottom:none;}
 .rd-task-row span{font-size:13.5px;color:var(--rd-text);}
 @media(min-width:900px){.rd-body{flex-wrap:nowrap;}}
+
+/* ============ DIGITAL BOARD (study room) ============ */
+.rd-board{background:linear-gradient(180deg,#10141F,#0B0F1A);border:10px solid #1C2233;border-radius:20px;box-shadow:0 0 0 1px var(--rd-border),0 18px 40px rgba(0,0,0,0.45),inset 0 0 0 1px rgba(255,255,255,0.04);display:flex;flex-direction:column;overflow:hidden;}
+.rd-board-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:8px 10px;background:rgba(255,255,255,0.03);border-bottom:1px solid var(--rd-border);}
+.rd-board-tabs{display:flex;gap:6px;flex-wrap:wrap;}
+.rd-board .rd-tab{flex-direction:row;gap:6px;padding:7px 12px;border-radius:10px;font-size:12.5px;}
+.rd-board .rd-tab-icon{font-size:15px;}
+.rd-board .rd-tab:disabled{cursor:default;opacity:0.55;}
+.rd-board .rd-tab.active:disabled{opacity:1;}
+.rd-board-status{font-size:11.5px;color:var(--rd-muted);}
+.rd-board.is-controller .rd-board-status{color:var(--rd-cyan);}
+.rd-board-screen{flex:1;min-height:420px;padding:12px;overflow-y:auto;}
+.rd-board-screen .rd-panel{margin-bottom:10px;}
+.rd-board-screen .rd-wb-panel{height:100%;display:flex;flex-direction:column;margin-bottom:0;}
+.rd-wb-toolbar[hidden]{display:none;}
+/* Right column: class video on top (like an online class), chat below it */
+.rd-class-video .call-panel-head{margin-bottom:8px;}
+.rd-class-video .jitsi-container{height:auto;aspect-ratio:16/10;margin-top:0;border:1px solid var(--rd-border);}
+.call-placeholder{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;font-size:28px;color:var(--rd-muted);background:radial-gradient(circle at 50% 40%,rgba(51,224,255,0.08),transparent 70%);}
+.call-placeholder span{font-size:12px;line-height:1.5;}
+.rd-chat-head{display:flex;align-items:center;justify-content:space-between;gap:8px;position:relative;}
+.rd-chat-head .rd-side-title{margin:0 0 8px;}
+.rd-people-toggle summary{list-style:none;cursor:pointer;font-size:12px;font-weight:600;color:var(--rd-text);background:rgba(255,255,255,0.06);border:1px solid var(--rd-border);border-radius:999px;padding:3px 10px;margin-bottom:8px;}
+.rd-people-toggle summary::-webkit-details-marker{display:none;}
+.rd-people-pop{position:absolute;right:0;top:32px;z-index:20;width:240px;max-height:260px;overflow-y:auto;background:#111726;border:1px solid var(--rd-border);border-radius:12px;padding:10px;box-shadow:0 12px 30px rgba(0,0,0,0.5);}
+@media(min-width:900px){
+  html.room-focus-mode .rd-chat-block{min-height:0;}
+}
+.rd-whiteboard.readonly{cursor:default;}
+@media(min-width:900px){
+  /* Laptop: the board takes the whole width except a slim chat column, and
+     fills the screen height under the room header. */
+  html.room-focus-mode .rd-main{flex:1 1 auto;min-width:0;}
+  html.room-focus-mode .rd-side{flex:0 0 clamp(340px,30vw,440px);min-width:0;height:calc(100vh - 150px);}
+  html.room-focus-mode .rd-board{height:calc(100vh - 150px);}
+  /* Keep the canvas's aspect ratio (so drawings look the same on every
+     screen) but cap its width so it also fits the board's height. */
+  html.room-focus-mode .rd-board-screen .rd-whiteboard{aspect-ratio:1600/853;max-width:calc((100vh - 280px) * 1.876);margin:0 auto;display:block;}
+  html.room-focus-mode .rd-board-screen .rd-notes-area{min-height:calc(100vh - 290px);}
+}
 .room-dark .bubble-row:not(.self) .bubble{background:rgba(255,255,255,0.06);border:1px solid var(--rd-border);color:var(--rd-text);}
 .room-dark .bubble-row.self .bubble{background:linear-gradient(135deg,var(--rd-cyan),#1D9DBF);color:#04222A;}
 .room-dark .bubble-name{color:var(--rd-muted);}
@@ -313,6 +361,7 @@ html.room-focus-mode .room-dark{border-radius:0; min-height:100vh; margin:0; pad
         <div class="view" id="view-test"></div>
         <div class="view" id="view-livetest"></div>
         <div class="view" id="view-rooms"></div>
+        <div class="view" id="view-discussion"></div>
         <div class="view" id="view-doubts"></div>
         <div class="view" id="view-live"></div>
         <div class="view" id="view-private"></div>

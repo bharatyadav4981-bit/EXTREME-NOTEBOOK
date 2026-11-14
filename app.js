@@ -4,6 +4,17 @@ import { SUPABASE_URL, SUPABASE_ANON_KEY, PAYMENT_LINK } from './config.js';
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const configured = !SUPABASE_URL.includes('YOUR-PROJECT');
 
+// SECURITY/RELIABILITY (#9): centralized helper so every important mutation
+// checks the client exists and actually inspects { data, error } instead of
+// assuming success. Wrap any Supabase call with this and it throws a clear,
+// user-facing error instead of quietly doing nothing or crashing later with
+// a confusing "cannot read property of undefined".
+function assertSupabase(result, fallbackMessage){
+  if (!supabase) throw new Error('Not connected to the database — refresh the page and try again.');
+  if (result && result.error) throw new Error(result.error.message || fallbackMessage || 'That action failed.');
+  return result?.data;
+}
+
 /* ============ ICONS ============ */
 const ICONS = {
   home:'<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5 12 3l9 6.5"/><path d="M5 10v10h14V10"/></svg>',
@@ -38,6 +49,12 @@ const ICONS = {
   rooms:'<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3"/><path d="M2.5 20c0-3.5 3-6 6.5-6s6.5 2.5 6.5 6"/><circle cx="18" cy="9" r="2.3"/><path d="M15.5 14c2.8.3 5 2.3 5 5.5"/></svg>',
   music:'<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>',
   x:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>',
+  palette:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 1 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.4-.3-.4-.5-.9-.5-1.4 0-1.1.9-2 2-2h2.3A4.2 4.2 0 0 0 21.5 11 9.9 9.9 0 0 0 12 2Z"/><circle cx="7.5" cy="10.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="12" cy="7" r="1.2" fill="currentColor" stroke="none"/><circle cx="16.5" cy="10.5" r="1.2" fill="currentColor" stroke="none"/></svg>',
+  debate:'<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10h.01M12 10h.01M16 10h.01"/><path d="M4 6h16v9H9l-4 4v-4H4z"/></svg>',
+  teacher:'<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 10 12 5 2 10l10 5 10-5Z"/><path d="M6 12v5c0 1.5 2.5 3 6 3s6-1.5 6-3v-5"/></svg>',
+  hand:'<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12V6a1.5 1.5 0 0 1 3 0v5"/><path d="M11 11V4a1.5 1.5 0 0 1 3 0v7"/><path d="M14 11V5.5a1.5 1.5 0 0 1 3 0V12"/><path d="M17 8.5a1.5 1.5 0 0 1 3 0V14c0 4-2.5 7-7 7s-6-2-7.5-4.5L4 13c-.7-1 .3-2.3 1.5-1.8L8 12"/></svg>',
+  medal:'<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="15" r="6"/><path d="m9 10-3-7M15 10l3-7M9 3h6"/></svg>',
+  poll:'<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>',
 };
 
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -119,7 +136,7 @@ function chatBubblesHTML(messages, myId, { idKey }){
 }
 function linkifyMessage(content){
   const escaped = esc(content);
-  return escaped.replace(/(https?:\/\/[^\s]+)/g, url => `<a href="${url}" target="_blank" rel="noopener" class="rd-file-link">🔗 Open attachment</a>`);
+  return escaped.replace(/(https?:\/\/[^\s]+)/g, url => `<a href="${url}" target="_blank" rel="noopener noreferrer" class="rd-file-link">🔗 Open attachment</a>`);
 }
 async function sha256(str){
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
@@ -147,13 +164,26 @@ const state = {
   nowPlaying: null,
   nowPlayingChannel: null,
   noise: { ctx:null, source:null, gain:null, playing:false, type:'white' },
-  call: { active:false, roomId:null, jitsi:null, fullscreen:false },
+  call: { active:false, roomId:null, roomType:null, jitsi:null, fullscreen:false },
   roomTab: 'notes',
   whiteboard: { color:'#33E0FF', size:3, erasing:false },
   whiteboardChannel: null,
   notesChannel: null,
   tasksChannel: null,
+  boardChannel: null,
   roomTasks: [],
+  discussionRooms: [],
+  activeDiscussionRoomId: null,
+  discussionTab: 'discussion',
+  discussionMessages: [],
+  discussionChannel: null,
+  discussionActiveTopic: null,
+  discussionRounds: [],
+  discussionActiveRound: null,
+  discussionAnswers: [],
+  discussionPolls: [],
+  discussionLeaderboard: [],
+  discussionHandQueue: [],
   roomMembersFull: [],
   bookmarkIds: new Set(),
   openNote: null,
@@ -240,6 +270,16 @@ async function fetchAvailableRoomCodes(){
   const { data } = await supabase.from('study_room_vip_codes').select('*').is('claimed_by', null).order('is_admin_reserved', { ascending:false }).order('code');
   return data || [];
 }
+// VIP numbers an admin has assigned to the current user (after payment) that
+// aren't already in use as a room number.
+async function fetchMyAssignedRoomCodes(){
+  if (!state.session) return [];
+  const { data: mine } = await supabase.from('study_room_vip_codes').select('*').eq('claimed_by', state.session.user.id).order('code');
+  if (!mine?.length) return [];
+  const { data: used } = await supabase.from('study_rooms').select('room_code').in('room_code', mine.map(c=>c.code));
+  const usedSet = new Set((used||[]).map(r=>r.room_code));
+  return mine.filter(c=>!usedSet.has(c.code));
+}
 async function createStudyRoom(name, isPremium, price, vipCode){
   const isAdmin = state.profile?.role === 'admin';
   // Admins can create a room free or VIP, however they like. Anyone else
@@ -254,10 +294,15 @@ async function createStudyRoom(name, isPremium, price, vipCode){
     const { data: codeRow } = await supabase.from('study_room_vip_codes').select('*').eq('code', vipCode).maybeSingle();
     if (!codeRow) throw new Error('That room number is not available');
     if (codeRow.is_admin_reserved && !isAdmin) throw new Error('That number is reserved for the host/admin');
-    if (codeRow.is_admin_reserved){
+    if (codeRow.claimed_by === state.session.user.id){
+      // Already assigned to this user (by an admin after payment) — nothing to claim.
+    } else if (codeRow.is_admin_reserved){
       await supabase.from('study_room_vip_codes').update({ claimed_by: state.session.user.id, claimed_at: new Date().toISOString() }).eq('code', vipCode);
     } else {
       if (codeRow.claimed_by) throw new Error('That number was just taken — pick another');
+      if (!isAdmin && Number(codeRow.price) > 0){
+        throw new Error(`${vipCode} is a paid VIP number (₹${codeRow.price} one-time). Once your payment is confirmed, an admin will assign it to your account and it'll show up as yours here. Until then, pick a random number.`);
+      }
       const { data: claimed, error: claimErr } = await supabase.from('study_room_vip_codes')
         .update({ claimed_by: state.session.user.id, claimed_at: new Date().toISOString() })
         .eq('code', vipCode).is('claimed_by', null).select();
@@ -325,23 +370,27 @@ async function loadRoomAccessRequests(roomId){
   const { data } = await supabase.from('study_room_access_requests').select('*, profiles(username,name,avatar_url)').eq('room_id', roomId).eq('status','pending').order('created_at', { ascending:true });
   state.roomAccessRequests = data || [];
 }
-async function loadRoomMembers(roomId){
+// NOTE (#1): despite the old name, this reads subscription/approval status
+// from study_room_access_requests — it is NOT the actual member list. The
+// real, current member list always comes from loadAllRoomMembers(), which
+// reads study_room_members. This is only used to show subscription expiry
+// ("Xd left" / "Renew") in the Manage Room modal.
+async function loadRoomSubscriptions(roomId){
   const { data } = await supabase.from('study_room_access_requests').select('*, profiles(username,name,avatar_url)').eq('room_id', roomId).eq('status','approved').order('resolved_at', { ascending:false });
   return data || [];
 }
 async function resolveRoomAccessRequest(request, approve){
   const expiresAt = approve ? new Date(Date.now() + 30*24*60*60*1000).toISOString() : null;
-  await supabase.from('study_room_access_requests').update({ status: approve?'approved':'rejected', resolved_at: new Date().toISOString(), expires_at: expiresAt }).eq('id', request.id);
+  assertSupabase(await supabase.from('study_room_access_requests').update({ status: approve?'approved':'rejected', resolved_at: new Date().toISOString(), expires_at: expiresAt }).eq('id', request.id), 'Could not update that request');
   if (approve){
-    await supabase.from('study_room_members').upsert({ room_id: request.room_id, user_id: request.user_id });
+    assertSupabase(await supabase.from('study_room_members').upsert({ room_id: request.room_id, user_id: request.user_id }), 'Could not add them to the room');
   }
 }
 async function renewRoomAccess(requestId){
-  await supabase.from('study_room_access_requests').update({ expires_at: new Date(Date.now() + 30*24*60*60*1000).toISOString() }).eq('id', requestId);
+  assertSupabase(await supabase.from('study_room_access_requests').update({ expires_at: new Date(Date.now() + 30*24*60*60*1000).toISOString() }).eq('id', requestId), 'Could not renew access');
 }
 async function updateRoomSettings(roomId, { isPremium, price, pinnedMessage }){
-  const { error } = await supabase.from('study_rooms').update({ is_premium: !!isPremium, price: isPremium ? Math.max(0, Number(price)||0) : 0, pinned_message: pinnedMessage || null }).eq('id', roomId);
-  if (error) throw error;
+  assertSupabase(await supabase.from('study_rooms').update({ is_premium: !!isPremium, price: isPremium ? Math.max(0, Number(price)||0) : 0, pinned_message: pinnedMessage || null }).eq('id', roomId), 'Only admins can set a price');
 }
 
 /* ---- Member management: co-host, remove, block, lock room ---- */
@@ -350,86 +399,151 @@ async function loadAllRoomMembers(roomId){
   return data || [];
 }
 async function setCoHost(roomId, userId, value){
-  const { data, error } = await supabase.from('study_room_members').update({ co_host: value }).eq('room_id', roomId).eq('user_id', userId).select();
-  if (error) throw error;
+  const data = assertSupabase(await supabase.from('study_room_members').update({ co_host: value }).eq('room_id', roomId).eq('user_id', userId).select(), 'Could not update co-host');
   // With row-level security on, a blocked update returns no error and no
   // rows — which is exactly the silent failure this used to have. Surface
   // it instead of pretending it worked.
   if (!data || !data.length) throw new Error('Could not update co-host — make sure the latest schema.sql has been run (co-host RLS policy).');
 }
 async function removeMember(roomId, userId){
-  await supabase.from('study_room_members').delete().eq('room_id', roomId).eq('user_id', userId);
+  assertSupabase(await supabase.from('study_room_members').delete().eq('room_id', roomId).eq('user_id', userId), 'Could not remove that member');
 }
 async function banMember(roomId, userId){
-  await supabase.from('study_room_bans').insert({ room_id: roomId, user_id: userId });
+  // upsert instead of insert: banning someone already on the ban list (e.g.
+  // clicking twice, or a stale UI) must not throw a duplicate-key error.
+  assertSupabase(await supabase.from('study_room_bans').upsert({ room_id: roomId, user_id: userId }), 'Could not block that member');
   await removeMember(roomId, userId);
 }
+async function unbanMember(roomId, userId){
+  assertSupabase(await supabase.from('study_room_bans').delete().eq('room_id', roomId).eq('user_id', userId), 'Could not unblock that member');
+}
+// Fire-and-forget notification helper — failing to notify someone should
+// never block the actual action (appointing a teacher, scoring an answer,
+// etc.), so callers just call this without awaiting/catching it themselves.
+async function createNotification(userId, type, content){
+  try{
+    await supabase.from('notifications').insert({ user_id: userId, created_by: state.session.user.id, type, content });
+  }catch(e){ console.error('[notify] failed to create notification:', e); }
+}
+async function loadRoomBans(roomId){
+  const { data } = await supabase.from('study_room_bans').select('*, profiles(username,name,avatar_url)').eq('room_id', roomId).order('banned_at', { ascending:false });
+  return data || [];
+}
 async function toggleRoomLock(roomId, locked){
-  await supabase.from('study_rooms').update({ locked }).eq('id', roomId);
+  assertSupabase(await supabase.from('study_rooms').update({ locked }).eq('id', roomId), 'Could not update the room lock');
 }
 
-/* ---- Study call via Jitsi Meet ----
-   The earlier version of this rolled a custom peer-to-peer WebRTC mesh with
-   only a free public STUN/TURN server. That works on friendly networks but
-   is genuinely unreliable across mixed networks (mobile data + Wi-Fi +
-   hotspot) — the public relay gets overloaded and connections silently die.
-   Getting that "just works everywhere" reliability really does need real
-   infrastructure, which Jitsi Meet's free public server already provides
-   (proper TURN/media-relay servers, tested at huge scale). Embedding their
-   room here needs no signup, no API key, and no backend of ours at all —
-   every member of a study room who opens the call lands in the same Jitsi
-   room and can see/hear everyone else in it. */
+/* ---- Shared room video call (Jitsi) ----
+   The call is deliberately namespaced by room TYPE + room id.  This prevents
+   a Study Room and a Discussion Room from ever landing in the same meeting.
+   It also cleans up an old Jitsi instance before a route/tab changes. */
+const JITSI_DOMAIN = 'meet.jit.si';
+let jitsiScriptPromise = null;
+
 function loadJitsiScript(){
-  return new Promise((resolve, reject) => {
-    if (window.JitsiMeetExternalAPI) return resolve();
+  if (window.JitsiMeetExternalAPI) return Promise.resolve();
+  if (jitsiScriptPromise) return jitsiScriptPromise;
+  jitsiScriptPromise = new Promise((resolve, reject) => {
     const existing = document.getElementById('jitsi-external-api');
-    if (existing){ existing.addEventListener('load', resolve); existing.addEventListener('error', reject); return; }
+    if (existing){
+      existing.addEventListener('load', resolve, {once:true});
+      existing.addEventListener('error', ()=>reject(new Error('Video call service could not be loaded. Check your internet connection.')), {once:true});
+      return;
+    }
     const s = document.createElement('script');
     s.id = 'jitsi-external-api';
-    s.src = 'https://meet.jit.si/external_api.js';
+    s.src = `https://${JITSI_DOMAIN}/external_api.js`;
+    s.async = true;
     s.onload = resolve;
-    s.onerror = () => reject(new Error('Could not reach the video call service — check your internet connection'));
+    s.onerror = ()=>reject(new Error('Video call service could not be loaded. Check your internet connection.'));
     document.head.appendChild(s);
   });
+  return jitsiScriptPromise;
 }
-async function startCall(roomId, room){
+
+async function startCall(roomId, room, roomType='study'){
   const container = document.getElementById('jitsiContainer');
-  if (!container) return;
+  if (!container) { toast('Video area is not available. Re-open the Call tab.'); return; }
+
+  // If another room/type is active, dispose it first.
+  if (state.call.jitsi && (state.call.roomId !== roomId || state.call.roomType !== roomType)){
+    endCall();
+  }
   try{
     await loadJitsiScript();
   }catch(err){ toast(err.message); return; }
+
   if (state.call.jitsi){ try{ state.call.jitsi.dispose(); }catch(e){} }
-  container.innerHTML = '';
-  // Namespaced so it never collides with someone else's random public
-  // meet.jit.si room, and stable per study-room so returning members land
-  // in the same call.
-  const roomName = `ExtremeNotebookStudyRoom-${room.room_code}-${roomId.slice(0,8)}`;
-  state.call.jitsi = new window.JitsiMeetExternalAPI('meet.jit.si', {
-    roomName,
-    parentNode: container,
-    width: '100%',
-    height: '100%',
-    userInfo: { displayName: state.profile?.name || state.profile?.username || 'Student' },
-    configOverwrite: { prejoinPageEnabled: false, disableDeepLinking: true, startWithVideoMuted: false, startWithAudioMuted: false },
-    interfaceConfigOverwrite: { SHOW_JITSI_WATERMARK: false, SHOW_WATERMARK_FOR_GUESTS: false, MOBILE_APP_PROMO: false },
-  });
-  state.call.active = true;
-  state.call.roomId = roomId;
-  state.call.jitsi.addEventListener('videoConferenceLeft', () => { endCall(); });
-  renderCallButtons();
+  container.innerHTML = '<div style="height:100%;display:grid;place-items:center;color:var(--rd-muted);">Connecting to video call…</div>';
+
+  const safeCode = String(room.room_code || roomId).replace(/[^a-zA-Z0-9_-]/g,'-');
+  const roomName = `TEN-${roomType}-${safeCode}-${String(roomId).slice(0,8)}`;
+
+  try{
+    state.call.jitsi = new window.JitsiMeetExternalAPI(JITSI_DOMAIN, {
+      roomName,
+      parentNode: container,
+      width: '100%',
+      height: '100%',
+      userInfo: { displayName: state.profile?.name || state.profile?.username || 'Student' },
+      configOverwrite: {
+        prejoinPageEnabled: false,
+        prejoinConfig: { enabled: false },
+        requireDisplayName: false,
+        disableDeepLinking: true,
+        startWithVideoMuted: false,
+        startWithAudioMuted: false,
+        enableWelcomePage: false,
+        hideLobbyButton: true,
+        disableAP: false
+      },
+      interfaceConfigOverwrite: {
+        SHOW_JITSI_WATERMARK: false,
+        SHOW_WATERMARK_FOR_GUESTS: false,
+        MOBILE_APP_PROMO: false
+      }
+    });
+    state.call.active = true;
+    state.call.roomId = roomId;
+    state.call.roomType = roomType;
+    state.call.jitsi.addEventListener('videoConferenceLeft', () => {
+      if (state.call.roomId === roomId) endCall();
+    });
+    state.call.jitsi.addEventListener('readyToClose', () => {
+      if (state.call.roomId === roomId) endCall();
+    });
+    renderCallButtons();
+  }catch(err){
+    state.call.jitsi = null;
+    state.call.active = false;
+    state.call.roomId = null;
+    state.call.roomType = null;
+    container.innerHTML = '';
+    renderCallButtons();
+    toast('Could not start the video call. Please try again.');
+    console.error('[video-call]', err);
+  }
 }
+
 function endCall(){
-  if (state.call.jitsi){ try{ state.call.jitsi.dispose(); }catch(e){} state.call.jitsi = null; }
-  const container = document.getElementById('jitsiContainer');
-  if (container) container.innerHTML = '';
+  const old = state.call.jitsi;
+  state.call.jitsi = null;
   state.call.active = false;
+  state.call.roomId = null;
+  state.call.roomType = null;
+  if (old){ try{ old.dispose(); }catch(e){} }
+  const container = document.getElementById('jitsiContainer');
+  if (container) container.innerHTML = container.closest('.call-panel-inline') ? `<div class="call-placeholder">📹<span>Class ki video call yahan dikhegi.<br>"Start / join" dabao.</span></div>` : '';
   renderCallButtons();
 }
+
 function renderCallButtons(){
   const startBtn = document.getElementById('startCallBtn');
   const leaveBtn = document.getElementById('leaveCallBtn');
   if (startBtn) startBtn.style.display = state.call.active ? 'none' : 'inline-flex';
   if (leaveBtn) leaveBtn.style.display = state.call.active ? 'inline-flex' : 'none';
+  const fsBtn = document.getElementById('callFsBtn');
+  if (fsBtn) fsBtn.style.display = state.call.active ? 'inline-flex' : 'none';
 }
 
 async function loadWhiteboardStrokes(roomId){
@@ -459,9 +573,14 @@ function subscribeWhiteboard(roomId, canvas){
       if (payload.new.created_by === state.session.user.id) return;
       drawStrokeOnCanvas(document.getElementById('whiteboardCanvas'), payload.new);
     })
-    .on('broadcast', { event:'wb-clear' }, () => {
+    .on('broadcast', { event:'wb-clear' }, async () => {
+      // Anyone on the channel can send a broadcast, so don't trust it blindly —
+      // redraw from the database, which only board controllers can clear.
       const c = document.getElementById('whiteboardCanvas');
-      if (c) c.getContext('2d').clearRect(0,0,c.width,c.height);
+      if (!c) return;
+      const strokes = await loadWhiteboardStrokes(roomId);
+      c.getContext('2d').clearRect(0,0,c.width,c.height);
+      strokes.forEach(s=>drawStrokeOnCanvas(c, s));
     })
     .subscribe();
 }
@@ -486,6 +605,10 @@ function setupWhiteboardCanvas(canvas, roomId){
     if (!drawing) return;
     drawing = false;
     if (points.length > 1){
+      // Intentionally best-effort: a dropped stroke mid-drawing is a minor,
+      // self-correcting visual sync gap (not a critical mutation like a
+      // score or a payment), and toasting on every failed segment during
+      // rapid drawing would be constant noise. Left silent on purpose.
       try{ await addWhiteboardStroke(roomId, points, currentColor(), currentSize()); }catch(e){}
     }
     points = [];
@@ -544,6 +667,30 @@ function subscribeRoomTasks(roomId, onChange){
     .on('postgres_changes', { event:'*', schema:'public', table:'study_room_tasks', filter:`room_id=eq.${roomId}` }, async () => {
       state.roomTasks = await loadRoomTasks(roomId);
       onChange();
+    })
+    .subscribe();
+}
+
+/* ---- Digital board: host / teacher / admin drive it, students follow ---- */
+const BOARD_TABS = ['whiteboard','notes','music','tasks','teacher'];
+function canControlBoard(room){
+  const me = state.session?.user?.id;
+  return state.profile?.role === 'admin' || room.created_by === me || (!!room.teacher_id && room.teacher_id === me);
+}
+async function loadRoomBoard(roomId){
+  const { data } = await supabase.from('study_room_board').select('*').eq('room_id', roomId).maybeSingle();
+  return data || null;
+}
+async function setRoomBoardTab(roomId, tab){
+  const { error } = await supabase.from('study_room_board').upsert({ room_id: roomId, active_tab: tab, updated_by: state.session.user.id, updated_at: new Date().toISOString() });
+  if (error) throw error;
+}
+function subscribeRoomBoard(roomId, onTab){
+  if (state.boardChannel) supabase.removeChannel(state.boardChannel);
+  state.boardChannel = supabase.channel('board-'+roomId)
+    .on('postgres_changes', { event:'*', schema:'public', table:'study_room_board', filter:`room_id=eq.${roomId}` }, payload => {
+      const tab = payload.new?.active_tab;
+      if (BOARD_TABS.includes(tab) && tab !== state.roomTab) onTab(tab);
     })
     .subscribe();
 }
@@ -629,9 +776,18 @@ async function fetchTestQuestions(testId){
   const { data } = await supabase.from('test_questions').select('*').eq('test_id', testId).order('created_at');
   return data || [];
 }
-async function submitTestAttempt(testId, score, total){
-  const { error } = await supabase.from('test_attempts').insert({ test_id: testId, user_id: state.session.user.id, score, total });
+async function submitTestAttempt(testId, answers){
+  // The server now recomputes score/total itself (see verify_test_attempt_score
+  // trigger in schema.sql) — whatever we send for score/total is ignored and
+  // overwritten, so we don't even bother computing it client-side anymore.
+  // We ask for the row back so the UI shows the *verified* score, not a
+  // client-guessed one.
+  const { data, error } = await supabase.from('test_attempts')
+    .insert({ test_id: testId, user_id: state.session.user.id, answers })
+    .select()
+    .single();
   if (error) throw error;
+  return data;
 }
 
 async function loadSubjects(){
@@ -664,7 +820,23 @@ async function deleteNote(noteId){
   const { error } = await supabase.from('notes').delete().eq('id', noteId);
   if (error) throw error;
 }
+// SECURITY/UX (#10): reject unsupported file types and oversized files
+// client-side before ever uploading them. This is a first line of defense
+// for a better error message — the real security boundary is still the
+// storage bucket's own policies (see schema.sql), since client-side checks
+// alone can always be bypassed by a determined user calling the API directly.
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MB
+function validateUpload(file, allowedExtensions){
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  if (!allowedExtensions.includes(ext)){
+    throw new Error(`That file type isn't supported. Allowed: ${allowedExtensions.join(', ').toUpperCase()}`);
+  }
+  if (file.size > MAX_UPLOAD_BYTES){
+    throw new Error('That file is too large — the maximum size is 20 MB.');
+  }
+}
 async function uploadNoteFile(file){
+  validateUpload(file, ['pdf','png','jpg','jpeg','webp']);
   const ext = (file.name.split('.').pop() || 'pdf').toLowerCase();
   const path = `notes/${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`;
   const { error } = await supabase.storage.from('attachments').upload(path, file, { upsert:true });
@@ -843,14 +1015,23 @@ async function clearConversation(conversationId){
   await supabase.from('private_messages').delete().eq('conversation_id', conversationId);
 }
 
-/* -- star hide / pin lock -- */
+/* -- star hide / pin lock --
+   SECURITY NOTE (#18): this PIN is a local "re-enter to unhide" UX gate on
+   an already-authenticated session/device, not a network security boundary
+   — the actual access control for private messages is enforced by Supabase
+   RLS (participants-only), verified in schema.sql. Because of that, an
+   unsalted SHA-256 of a 4-digit PIN is an acceptable trade-off here: even a
+   full hash collision attempt gains an attacker nothing beyond what they'd
+   already see on an unlocked device, since it never gates a database call. */
 async function setPrivateHidden(hidden){
   state.privateHidden = hidden;
-  await supabase.from('profiles').update({ settings: { ...(state.profile.settings||{}), private_hidden: hidden } }).eq('id', state.session.user.id);
+  const { error } = await supabase.from('profiles').update({ settings: { ...(state.profile.settings||{}), private_hidden: hidden } }).eq('id', state.session.user.id);
+  if (error){ state.privateHidden = !hidden; throw error; } // restore prior state on failure (#24)
 }
 async function setPin(pin){
   const hash = await sha256(pin);
-  await supabase.from('profiles').update({ pin_hash: hash }).eq('id', state.session.user.id);
+  const { error } = await supabase.from('profiles').update({ pin_hash: hash }).eq('id', state.session.user.id);
+  if (error) throw error;
   state.profile.pin_hash = hash;
 }
 async function verifyPin(pin){
@@ -878,6 +1059,7 @@ const SIDE_LINKS = [
   { id:'test', label:'Test', icon:'clipboard' },
   { id:'livetest', label:'Live Test', icon:'timer' },
   { id:'rooms', label:'Study Rooms', icon:'rooms' },
+  { id:'discussion', label:'Discussion Rooms', icon:'debate' },
   { id:'doubts', label:'Public chat', icon:'doubts' },
   { id:'live', label:'Live chat', icon:'live' },
   { id:'private', label:'Chats', icon:'plane' },
@@ -1077,6 +1259,7 @@ async function renderHome(){
       <div class="tile subject-card" data-nav="test"><div class="tile-icon" style="background:var(--paper);font-size:20px;">${ICONS.clipboard}</div><div class="subject-info"><p class="tile-name">Test</p><p class="tile-meta">Practice</p></div></div>
       <div class="tile subject-card" data-nav="livetest"><div class="tile-icon" style="background:var(--paper);font-size:20px;">${ICONS.timer}</div><div class="subject-info"><p class="tile-name">Live Test</p><p class="tile-meta">Hosted by admin</p></div></div>
       <div class="tile subject-card" data-nav="rooms"><div class="tile-icon" style="background:var(--paper);font-size:20px;">${ICONS.rooms}</div><div class="subject-info"><p class="tile-name">Study Rooms</p><p class="tile-meta">Study with friends</p></div></div>
+      <div class="tile subject-card" data-nav="discussion"><div class="tile-icon" style="background:var(--paper);font-size:20px;">${ICONS.debate}</div><div class="subject-info"><p class="tile-name">Discussion Rooms</p><p class="tile-meta">Debate &amp; compete</p></div></div>
     </div>
     <div class="section-head"><h2>Subjects</h2><a href="#" data-nav="study">View all</a></div>
     <div class="grid-4" id="homeSubjects"></div>
@@ -1211,7 +1394,7 @@ function openNewNoteModal(){
       go('notes');
     }catch(err){
       saveBtn.disabled = false; saveBtn.textContent = 'Save note';
-      toast('Could not save note — make sure the "attachments" storage bucket exists');
+      toast(err.message || 'Could not save note — make sure the "attachments" storage bucket exists');
     }
   });
 }
@@ -1224,18 +1407,33 @@ function bindChatTabs(scope){ scope.querySelectorAll('[data-tab]').forEach(b=>b.
 
 function renderDoubts(){
   const el = document.getElementById('view-doubts');
+  const isAdmin = state.profile?.role === 'admin';
   el.innerHTML = `
     ${chatTabsHTML()}
-    <div class="private-toolbar"><p class="hint">${state.questions.length} open doubts from the community</p></div>
-    <div id="qList"></div>
+    <div class="private-toolbar">
+      <p class="hint">${state.questions.length} open doubts from the community</p>
+      <button class="icon-btn" id="doubtAppearanceBtn" title="Chat appearance">${ICONS.palette}</button>
+    </div>
+    <div id="qList" class="chat-appearance-scope"></div>
     <div class="composer">
       <select id="askSubject" style="border:none;background:var(--paper);border-radius:9px;font-size:12.5px;padding:6px;">${state.subjects.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select>
-      <textarea rows="1" id="askInput" placeholder="Ask the community a doubt..."></textarea>
+      <textarea rows="1" id="askInput" placeholder="Ask your doubt..."></textarea>
       <button class="send-btn" id="askSend">${ICONS.send}</button>
     </div>
   `;
   bindChatTabs(el);
-  el.querySelector('#qList').innerHTML = state.questions.length ? state.questions.map(questionCardHTML).join('') : `<div class="empty"><p>No doubts yet. Be the first to ask one.</p></div>`;
+  loadAppSetting('doubt_chat_appearance').then(v => applyChatAppearanceTo(el.querySelector('#qList'), v));
+  el.querySelector('#doubtAppearanceBtn').addEventListener('click', async ()=>{
+    const current = await loadAppSetting('doubt_chat_appearance');
+    openChatAppearanceModal({
+      title: 'Doubt Chat appearance',
+      lockNote: 'Only host can change theme',
+      canEdit: isAdmin,
+      current,
+      onSave: async (value)=>{ await saveAppSetting('doubt_chat_appearance', value); applyChatAppearanceTo(el.querySelector('#qList'), value); }
+    });
+  });
+  el.querySelector('#qList').innerHTML += state.questions.length ? state.questions.map(questionCardHTML).join('') : `<div class="empty"><p>No doubts yet. Be the first to ask one.</p></div>`;
   bindQuestionCards(el.querySelector('#qList'));
   el.querySelector('#askSend').addEventListener('click', async ()=>{
     if (!requireAuth()) return;
@@ -1259,9 +1457,10 @@ async function renderLive(){
     <div class="thread-header">
       <div class="avatar" style="background:var(--green);">SR</div>
       <div class="info"><p class="name">Study room · Everyone</p><p class="status">Live · realtime</p></div>
+      <button class="icon-btn" id="liveAppearanceBtn" title="Chat appearance">${ICONS.palette}</button>
       ${isAdmin ? `<button class="icon-btn danger" id="clearLiveBtn" aria-label="Clear all live chat messages">${ICONS.stop}</button>` : ''}
     </div>
-    <div id="liveMessages"></div>
+    <div id="liveMessages" class="chat-appearance-scope"></div>
     <div class="composer">
       <textarea rows="1" id="liveInput" placeholder="${state.session? 'Message the room...' : 'Log in to send a message'}" ${state.session?'':'disabled'}></textarea>
       <button class="send-btn" id="liveSend">${ICONS.send}</button>
@@ -1269,6 +1468,17 @@ async function renderLive(){
   `;
   bindChatTabs(el);
   drawLiveMessages();
+  loadAppSetting('live_chat_appearance').then(v => applyChatAppearanceTo(el.querySelector('#liveMessages'), v));
+  el.querySelector('#liveAppearanceBtn').addEventListener('click', async ()=>{
+    const current = await loadAppSetting('live_chat_appearance');
+    openChatAppearanceModal({
+      title: 'Live Chat appearance',
+      lockNote: 'Only host can change theme',
+      canEdit: isAdmin,
+      current,
+      onSave: async (value)=>{ await saveAppSetting('live_chat_appearance', value); applyChatAppearanceTo(el.querySelector('#liveMessages'), value); }
+    });
+  });
   el.querySelector('#clearLiveBtn')?.addEventListener('click', ()=>{
     openModal(`
       <div class="modal">
@@ -1410,11 +1620,11 @@ async function renderPrivate(){
     tapTimes = tapTimes.filter(t => now - t < 700);
     tapTimes.push(now);
     if (tapTimes.length === 2 && !state.privateHidden){
-      await setPrivateHidden(true);
+      try{ await setPrivateHidden(true); }catch(e){ /* stays silent by design; state already reverted internally */ }
       tapTimes = [];
       renderRoute();
     } else if (tapTimes.length === 3 && state.privateHidden){
-      await setPrivateHidden(false);
+      try{ await setPrivateHidden(false); }catch(e){ /* stays silent by design; state already reverted internally */ }
       tapTimes = [];
       renderRoute();
     } else if (tapTimes.length >= 3){
@@ -1460,17 +1670,29 @@ async function renderThread(el){
       <div class="avatar-wrap" data-viewprofile="${c.other.id}" style="cursor:pointer;"><div class="avatar sm" style="overflow:hidden;">${avatarInner(c.other)}</div></div>
       <div class="info" data-viewprofile="${c.other.id}" style="cursor:pointer;"><p class="name">${esc(c.other.name||c.other.username)}${roleBadge(c.other)}</p></div>
       <div class="thread-actions">
+        <button class="icon-btn small" id="privAppearanceBtn" aria-label="Chat appearance">${ICONS.palette}</button>
         ${myRooms.length ? `<button class="icon-btn small" id="inviteToRoomBtn" aria-label="Invite to a study room">${ICONS.rooms}</button>` : ''}
         <button class="icon-btn small danger" id="stopPrivate" aria-label="Delete conversation">${ICONS.stop}</button>
       </div>
     </div>
-    <div id="threadMessages"></div>
+    <div id="threadMessages" class="chat-appearance-scope"></div>
     <div class="composer">
       <textarea rows="1" id="privInput" placeholder="Message ${esc((c.other.name||c.other.username).split(' ')[0])}..."></textarea>
       <button class="send-btn" id="privSend">${ICONS.send}</button>
     </div>
   `;
   drawThreadMessages();
+  loadConversationAppearance(c.id).then(v => applyChatAppearanceTo(el.querySelector('#threadMessages'), v));
+  el.querySelector('#privAppearanceBtn').addEventListener('click', async ()=>{
+    const current = await loadConversationAppearance(c.id);
+    openChatAppearanceModal({
+      title: `Chat with ${c.other.name||c.other.username}`,
+      lockNote: 'Both of you can customize this chat',
+      canEdit: true,
+      current,
+      onSave: async (value)=>{ await saveConversationAppearance(c.id, value); applyChatAppearanceTo(el.querySelector('#threadMessages'), value); }
+    });
+  });
   el.querySelector('#backToConvos').addEventListener('click', ()=>{ state.openConvoId=null; renderRoute(); });
   el.querySelectorAll('[data-viewprofile]').forEach(node=>node.addEventListener('click', ()=>openUserProfileModal(c.other.id)));
   el.querySelector('#inviteToRoomBtn')?.addEventListener('click', ()=>{
@@ -1552,10 +1774,15 @@ function renderPinScreen(el){
     else if (state.pinInput.length<4) state.pinInput += key;
     if (state.pinInput.length===4){
       if (isSet){
-        await setPin(state.pinInput);
-        state.privateLocked = false;
-        toast('PIN set. Chats are now lockable.');
-        renderRoute();
+        try{
+          await setPin(state.pinInput);
+          state.privateLocked = false;
+          toast('PIN set. Chats are now lockable.');
+          renderRoute();
+        }catch(err){
+          document.getElementById('pinError').textContent = err.message || 'Could not save PIN — try again.';
+          setTimeout(()=>{ state.pinInput=''; renderPinScreen(el); }, 800);
+        }
         return;
       } else {
         const ok = await verifyPin(state.pinInput);
@@ -1645,10 +1872,14 @@ async function openUserProfileModal(userId){
   });
 }
 
-function renderProfile(){
+async function renderProfile(){
   const el = document.getElementById('view-profile');
   if (!state.session){ return renderAuthGate(el); }
   const p = state.profile;
+  const achievements = await loadMyAchievements();
+  const medalCounts = {};
+  achievements.forEach(a=>{ medalCounts[a.medal_level] = (medalCounts[a.medal_level]||0)+1; });
+  const totalPoints = achievements.reduce((sum,a)=>sum+(a.score||0),0);
   el.innerHTML = `
     <div class="section-head"><h2>Profile</h2></div>
     <div class="profile-head">
@@ -1657,6 +1888,19 @@ function renderProfile(){
       <p>@${esc(p.username)} ${p.education?'· '+esc(p.education):''}</p></div>
     </div>
     <div class="card"><p style="font-size:13.5px;line-height:1.6;color:var(--ink-soft);margin:0;">${esc(p.bio || 'No bio yet — tap Edit profile to add one.')}</p></div>
+
+    <div class="section-head"><h2>My Achievements</h2></div>
+    <div class="stat-grid">
+      <div class="stat-card"><p class="stat-num">${achievements.length}</p><p class="stat-label">Total medals</p></div>
+      <div class="stat-card"><p class="stat-num">${totalPoints}</p><p class="stat-label">Discussion points</p></div>
+      <div class="stat-card"><p class="stat-num">${medalCounts.gold||0}</p><p class="stat-label">Gold medals</p></div>
+      <div class="stat-card"><p class="stat-num">${medalCounts.champion||0}</p><p class="stat-label">Champion wins</p></div>
+    </div>
+    <div id="achievementsList">${achievements.length ? achievements.slice(0,8).map(a=>`
+      <div class="card" style="display:flex;align-items:center;gap:10px;">
+        <span style="font-size:24px;">${MEDAL_EMOJI[a.medal_level]||'🏅'}</span>
+        <div style="flex:1;min-width:0;"><p style="font-weight:600;font-size:13.5px;margin:0;">${AWARD_LABELS[a.award_type]?.label||a.award_type}</p><p style="font-size:11.5px;color:var(--ink-faint);margin:0;">${esc(a.topic_title||a.room_code||'')} · ${a.score} pts</p></div>
+      </div>`).join('') : `<div class="empty"><p>No medals yet — join a Discussion Room to start earning them.</p></div>`}</div>
 
     <div class="section-head"><h2>My notes</h2><a href="#" id="newPersonalNoteLink">+ New note</a></div>
     <p style="font-size:12px;color:var(--ink-faint);margin:-10px 0 12px;">Personal notes only you can see. Share them into Live chat or a chat with a friend.</p>
@@ -1859,6 +2103,129 @@ function openAppearanceModal(){
     toast('Appearance updated');
   });
 }
+/* ============ CHAT APPEARANCE (per-surface: Live / Doubt / Private) ============
+   Live Chat & Doubt (Public) Chat: ONE shared look for everyone in that
+   chat, editable only by admins ("host-controlled" per the design spec).
+   Private Chat: one shared look per conversation, editable by EITHER
+   participant — saving updates it for both people in that chat. */
+const CHAT_THEME_PRESETS = {
+  midnight: { label:'Midnight', accent:'#4C6FFF', bg:'#0B1020' },
+  ocean:    { label:'Ocean',    accent:'#1EA7C9', bg:'#0A1E26' },
+  aurora:   { label:'Aurora',   accent:'#2FD5A4', bg:'#0B1F1A' },
+  lavender: { label:'Lavender', accent:'#9B7BE0', bg:'#1A1630' },
+  sunset:   { label:'Sunset',   accent:'#F0765A', bg:'#241212' },
+  forest:   { label:'Forest',   accent:'#3FAF7C', bg:'#0F1F16' },
+  rose:     { label:'Rose',     accent:'#E85D8A', bg:'#230F17' },
+  galaxy:   { label:'Galaxy',   accent:'#8B5CF6', bg:'#120B26' },
+  minimal:  { label:'Minimal',  accent:'#5A5A72', bg:'#F2F3F8' },
+  darkpremium: { label:'Dark Premium', accent:'#D4AF6A', bg:'#0A0A0A' },
+};
+const CHAT_FONT_PRESETS = {
+  modernsans: { label:'Modern Sans', stack:"'Inter', sans-serif" },
+  cleanrounded: { label:'Clean Rounded', stack:"'Trebuchet MS', 'Segoe UI Rounded', sans-serif" },
+  elegant: { label:'Elegant', stack:"Georgia, 'Times New Roman', serif" },
+  friendly: { label:'Friendly', stack:"'Comic Sans MS', 'Segoe UI', sans-serif" },
+  study: { label:'Study', stack:"'Fraunces', Georgia, serif" },
+  classic: { label:'Classic', stack:"'Times New Roman', serif" },
+};
+const CHAT_BUBBLE_STYLES = {
+  modern: { label:'Modern', radius:'16px' },
+  compact: { label:'Compact', radius:'8px' },
+  soft: { label:'Soft', radius:'22px' },
+};
+const CHAT_DENSITIES = {
+  comfortable: { label:'Comfortable', gap:'12px' },
+  compact: { label:'Compact', gap:'6px' },
+  spacious: { label:'Spacious', gap:'18px' },
+};
+const DEFAULT_CHAT_APPEARANCE = { theme:'midnight', font:'modernsans', bubble:'modern', density:'comfortable' };
+
+async function loadAppSetting(key){
+  const { data } = await supabase.from('app_settings').select('value').eq('key', key).maybeSingle();
+  return data?.value || null;
+}
+async function saveAppSetting(key, value){
+  const { error } = await supabase.from('app_settings').upsert({ key, value, updated_by: state.session.user.id, updated_at: new Date().toISOString() });
+  if (error) throw error;
+}
+async function loadConversationAppearance(conversationId){
+  const { data } = await supabase.from('conversation_appearance').select('value').eq('conversation_id', conversationId).maybeSingle();
+  return data?.value || null;
+}
+async function saveConversationAppearance(conversationId, value){
+  const { error } = await supabase.from('conversation_appearance').upsert({ conversation_id: conversationId, value, updated_by: state.session.user.id, updated_at: new Date().toISOString() });
+  if (error) throw error;
+}
+// Applies a chat-appearance value onto ONE container (not the whole app) via
+// scoped CSS variables — the bubble/composer CSS falls back to the normal
+// site theme when these aren't set, so this never leaks outside that chat.
+function applyChatAppearanceTo(containerEl, value){
+  if (!containerEl) return;
+  const v = { ...DEFAULT_CHAT_APPEARANCE, ...(value||{}) };
+  const theme = CHAT_THEME_PRESETS[v.theme] || CHAT_THEME_PRESETS.midnight;
+  const font = CHAT_FONT_PRESETS[v.font] || CHAT_FONT_PRESETS.modernsans;
+  const bubble = CHAT_BUBBLE_STYLES[v.bubble] || CHAT_BUBBLE_STYLES.modern;
+  const density = CHAT_DENSITIES[v.density] || CHAT_DENSITIES.comfortable;
+  containerEl.style.setProperty('--scoped-accent', theme.accent);
+  containerEl.style.setProperty('--scoped-chat-bg', theme.bg);
+  containerEl.style.setProperty('--scoped-font', font.stack);
+  containerEl.style.setProperty('--scoped-bubble-radius', bubble.radius);
+  containerEl.style.setProperty('--scoped-msg-gap', density.gap);
+  containerEl.classList.add('chat-appearance-scope');
+}
+function chatAppearanceSwatchesHTML(current){
+  return Object.entries(CHAT_THEME_PRESETS).map(([k,v])=>`
+    <button type="button" class="ca-swatch ${current===k?'active':''}" data-theme-swatch="${k}" style="background:${v.bg};">
+      <span class="ca-swatch-dot" style="background:${v.accent};"></span>
+      <span class="ca-swatch-label">${v.label}</span>
+    </button>`).join('');
+}
+// canEdit=false renders the read-only "🔒 Only host can change appearance"
+// state from the spec; canEdit=true (private chat, or admin in a
+// public/live chat) shows the full editable panel with an Apply button.
+function openChatAppearanceModal({ title, lockNote, canEdit, current, onSave }){
+  const v = { ...DEFAULT_CHAT_APPEARANCE, ...(current||{}) };
+  openModal(`
+    <div class="modal" style="max-width:480px;">
+      <h3>${esc(title)}</h3>
+      ${!canEdit ? `<p style="display:flex;align-items:center;gap:6px;background:var(--paper);border:1px solid var(--hair);border-radius:10px;padding:8px 12px;font-size:12.5px;color:var(--ink-soft);">🔒 ${esc(lockNote||'Only the host can change appearance')}</p>` : `<p style="font-size:12px;color:var(--ink-faint);margin-top:-6px;">${esc(lockNote||'')}</p>`}
+      <label style="margin-top:12px;">Theme</label>
+      <div class="ca-swatch-grid">${chatAppearanceSwatchesHTML(v.theme)}</div>
+      <label style="margin-top:12px;">Font</label>
+      <select id="caFont" ${canEdit?'':'disabled'}>${Object.entries(CHAT_FONT_PRESETS).map(([k,f])=>`<option value="${k}" ${v.font===k?'selected':''}>${f.label}</option>`).join('')}</select>
+      <label style="margin-top:12px;">Bubble style</label>
+      <select id="caBubble" ${canEdit?'':'disabled'}>${Object.entries(CHAT_BUBBLE_STYLES).map(([k,b])=>`<option value="${k}" ${v.bubble===k?'selected':''}>${b.label}</option>`).join('')}</select>
+      <label style="margin-top:12px;">Message density</label>
+      <select id="caDensity" ${canEdit?'':'disabled'}>${Object.entries(CHAT_DENSITIES).map(([k,d])=>`<option value="${k}" ${v.density===k?'selected':''}>${d.label}</option>`).join('')}</select>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" id="cancelCa">${canEdit?'Cancel':'Close'}</button>
+        ${canEdit ? `<button class="btn btn-primary" id="applyCa">Apply Theme</button>` : ''}
+      </div>
+    </div>
+  `);
+  let selectedTheme = v.theme;
+  document.getElementById('cancelCa').addEventListener('click', closeModal);
+  if (canEdit){
+    document.querySelectorAll('[data-theme-swatch]').forEach(b=>b.addEventListener('click', ()=>{
+      selectedTheme = b.dataset.themeSwatch;
+      document.querySelectorAll('[data-theme-swatch]').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active');
+    }));
+    document.getElementById('applyCa').addEventListener('click', async e=>{
+      const btn = e.currentTarget;
+      btn.disabled = true; btn.textContent = 'Saving...';
+      const newValue = {
+        theme: selectedTheme,
+        font: document.getElementById('caFont').value,
+        bubble: document.getElementById('caBubble').value,
+        density: document.getElementById('caDensity').value,
+      };
+      try{ await onSave(newValue); closeModal(); toast('Chat appearance updated'); }
+      catch(err){ btn.disabled = false; btn.textContent = 'Apply Theme'; toast(err.message || 'Could not save — try again'); }
+    });
+  }
+}
+
 function openUpgradeModal(){
   if (!requireAuth()) return;
   openModal(`
@@ -1996,20 +2363,29 @@ function renderTestTaking(el){
     state.activeTest.answers[qid] = Number(e.target.value);
   }));
   el.querySelector('#submitTest').addEventListener('click', async ()=>{
+    const submitBtn = el.querySelector('#submitTest');
+    submitBtn.disabled = true; submitBtn.textContent = 'Submitting...';
     const total = questions.length;
-    let score = 0;
-    questions.forEach(q=>{ if (state.activeTest.answers[q.id] === q.correct_index) score++; });
-    await submitTestAttempt(test.id, score, total).catch(()=>{});
-    const wasLive = state.activeTest.isLive;
-    state.activeTest = null;
-    openModal(`
-      <div class="modal">
-        <h3>Result</h3>
-        <p style="font-size:22px;font-weight:700;color:var(--ink);text-align:center;margin:10px 0;">${score} / ${total}</p>
-        <div class="modal-actions"><button class="btn btn-primary" id="closeResult" style="width:100%;justify-content:center;">Done</button></div>
-      </div>
-    `);
-    document.getElementById('closeResult').addEventListener('click', ()=>{ closeModal(); go(wasLive?'livetest':'test'); });
+    // We still show a quick local estimate while waiting, but the number
+    // that actually gets stored and displayed comes back from the server
+    // (see submitTestAttempt) — the database recomputes it independently
+    // so a tampered client-side score can never be what's saved.
+    try{
+      const saved = await submitTestAttempt(test.id, state.activeTest.answers);
+      const wasLive = state.activeTest.isLive;
+      state.activeTest = null;
+      openModal(`
+        <div class="modal">
+          <h3>Result</h3>
+          <p style="font-size:22px;font-weight:700;color:var(--ink);text-align:center;margin:10px 0;">${saved.score} / ${saved.total}</p>
+          <div class="modal-actions"><button class="btn btn-primary" id="closeResult" style="width:100%;justify-content:center;">Done</button></div>
+        </div>
+      `);
+      document.getElementById('closeResult').addEventListener('click', ()=>{ closeModal(); go(wasLive?'livetest':'test'); });
+    }catch(err){
+      submitBtn.disabled = false; submitBtn.textContent = 'Submit';
+      toast(err.message || 'Could not submit your test — try again');
+    }
   });
 }
 
@@ -2057,6 +2433,249 @@ function stopNoise(){
 
 
 /* ---- Study Rooms ---- */
+/* ============================================================
+   DISCUSSION ROOMS — study room + classroom + debate + leaderboard.
+   Data layer first (this block), UI further below.
+   ============================================================ */
+async function generateDiscussionRoomCode(){
+  const year = new Date().getFullYear();
+  for (let attempt=0; attempt<8; attempt++){
+    const seq = String(Math.floor(1 + Math.random()*9998)).padStart(4,'0');
+    const code = `DR-${year}-${seq}`;
+    const { data } = await supabase.from('discussion_rooms').select('id').eq('room_code', code).maybeSingle();
+    if (!data) return code;
+  }
+  return `DR-${year}-${Date.now().toString().slice(-4)}`;
+}
+async function createDiscussionRoom(fields){
+  const room_code = await generateDiscussionRoomCode();
+  const { data, error } = await supabase.from('discussion_rooms').insert({
+    room_code, name: fields.name, description: fields.description || null,
+    subject_id: fields.subjectId || null, host_id: state.session.user.id,
+    max_members: fields.maxMembers || 30, privacy: fields.privacy || 'public',
+    scoring_enabled: fields.scoringEnabled !== false, leaderboard_enabled: fields.leaderboardEnabled !== false,
+    medals_enabled: fields.medalsEnabled !== false,
+  }).select().single();
+  if (error) throw error;
+  await supabase.from('discussion_room_members').insert({ room_id: data.id, user_id: state.session.user.id });
+  return data;
+}
+async function loadMyDiscussionRooms(){
+  if (!state.session){ state.discussionRooms = []; return; }
+  const { data: memberships } = await supabase.from('discussion_room_members').select('room_id').eq('user_id', state.session.user.id);
+  const memberIds = (memberships||[]).map(m=>m.room_id);
+  const { data: publicRooms } = await supabase.from('discussion_rooms').select('*').eq('privacy','public').order('created_at',{ ascending:false }).limit(30);
+  const ids = new Set([...(memberIds||[]), ...(publicRooms||[]).map(r=>r.id)]);
+  const { data } = await supabase.from('discussion_rooms').select('*').in('id', [...ids]).order('created_at',{ ascending:false });
+  state.discussionRooms = data || [];
+}
+async function joinDiscussionRoomByCode(code){
+  const { data: room } = await supabase.from('discussion_rooms').select('*').eq('room_code', code.trim().toUpperCase()).maybeSingle();
+  if (!room) throw new Error('No discussion room found with that ID');
+  const { error } = await supabase.from('discussion_room_members').upsert({ room_id: room.id, user_id: state.session.user.id });
+  if (error) throw error;
+  return room;
+}
+async function loadDiscussionRoomMembers(roomId){
+  const { data } = await supabase.from('discussion_room_members').select('*, profiles(username,name,avatar_url,role)').eq('room_id', roomId).order('joined_at');
+  return data || [];
+}
+async function toggleRaiseHand(roomId, raised){
+  const { error } = await supabase.from('discussion_room_members').update({ hand_raised: raised, hand_raised_at: raised ? new Date().toISOString() : null }).eq('room_id', roomId).eq('user_id', state.session.user.id);
+  if (error) throw error;
+}
+async function loadHandQueue(roomId){
+  const { data } = await supabase.from('discussion_room_members').select('*, profiles(username,name,avatar_url)').eq('room_id', roomId).eq('hand_raised', true).order('hand_raised_at');
+  return data || [];
+}
+
+/* -- teacher management -- */
+async function appointTeacher(roomId, userId){
+  const { error } = await supabase.from('discussion_rooms').update({ teacher_id: userId }).eq('id', roomId);
+  if (error) throw error;
+  // make sure the newly-appointed teacher is also a room member
+  await supabase.from('discussion_room_members').upsert({ room_id: roomId, user_id: userId });
+  createNotification(userId, 'teacher_appointed', '👨‍🏫 You have been appointed as teacher of a discussion room.');
+}
+async function removeTeacher(roomId){
+  const { error } = await supabase.from('discussion_rooms').update({ teacher_id: null }).eq('id', roomId);
+  if (error) throw error;
+}
+async function searchUsersByName(query){
+  if (!query || query.length < 2) return [];
+  const { data } = await supabase.from('profiles').select('id,username,name,avatar_url').or(`username.ilike.%${query}%,name.ilike.%${query}%`).limit(8);
+  return data || [];
+}
+
+/* -- topics -- */
+async function createDiscussionTopic(roomId, fields){
+  // A new topic replaces the old "active" one so there's always exactly one
+  // topic on the board at a time, matching the single big Topic Board in the UI.
+  await supabase.from('discussion_topics').update({ is_active:false }).eq('room_id', roomId).eq('is_active', true);
+  const { error } = await supabase.from('discussion_topics').insert({
+    room_id: roomId, title: fields.title, description: fields.description || null,
+    subject_id: fields.subjectId || null, difficulty: fields.difficulty || 'medium',
+    discussion_minutes: fields.minutes || 20, image_url: fields.imageUrl || null,
+    file_url: fields.fileUrl || null, created_by: state.session.user.id,
+  });
+  if (error) throw error;
+}
+async function loadActiveTopic(roomId){
+  const { data } = await supabase.from('discussion_topics').select('*').eq('room_id', roomId).eq('is_active', true).order('created_at',{ ascending:false }).limit(1).maybeSingle();
+  return data || null;
+}
+
+/* -- rounds -- */
+const ROUND_TYPE_QUESTIONS = {
+  knowledge: 'What do you already know about this topic?',
+  thinking: 'What do you think is the biggest problem related to this topic?',
+  advice: 'What solution or advice would you give?',
+  challenge: 'Harder follow-up — explain your reasoning, not just your answer.',
+  final: 'What did you learn from this discussion?',
+};
+async function createDiscussionRound(roomId, topicId, roundType, customQuestion, timerSeconds){
+  const { count } = await supabase.from('discussion_rounds').select('id', { count:'exact', head:true }).eq('room_id', roomId);
+  const { data, error } = await supabase.from('discussion_rounds').insert({
+    room_id: roomId, topic_id: topicId, round_number: (count||0)+1, round_type: roundType,
+    question: customQuestion || ROUND_TYPE_QUESTIONS[roundType] || 'Share your thoughts.',
+    timer_seconds: timerSeconds || 60, created_by: state.session.user.id,
+  }).select().single();
+  if (error) throw error;
+  return data;
+}
+async function startDiscussionRound(roundId, participantId){
+  const { error } = await supabase.from('discussion_rounds').update({ status:'active', started_at:new Date().toISOString(), current_participant_id: participantId || null }).eq('id', roundId);
+  if (error) throw error;
+}
+async function selectRoundParticipant(roundId, participantId){
+  const { error } = await supabase.from('discussion_rounds').update({ current_participant_id: participantId }).eq('id', roundId);
+  if (error) throw error;
+  if (participantId) createNotification(participantId, 'your_turn', "✋ It's your turn — you have been selected to answer.");
+}
+async function endDiscussionRound(roundId){
+  const { error } = await supabase.from('discussion_rounds').update({ status:'ended', ended_at:new Date().toISOString() }).eq('id', roundId);
+  if (error) throw error;
+}
+async function loadDiscussionRounds(roomId){
+  const { data } = await supabase.from('discussion_rounds').select('*').eq('room_id', roomId).order('round_number');
+  return data || [];
+}
+
+/* -- answers & scoring -- */
+async function submitDiscussionAnswer(roundId, content, timeTakenSeconds){
+  const { data, error } = await supabase.from('discussion_answers').insert({
+    round_id: roundId, user_id: state.session.user.id, content, time_taken_seconds: timeTakenSeconds || null,
+  }).select().single();
+  if (error) throw error;
+  return data;
+}
+async function scoreDiscussionAnswer(answerId, scores){
+  // Server-side trigger clamps every value to 0-10 (0-20 for bonus) and
+  // stamps evaluated_by/at — whatever we send here is a *request*, not the
+  // final truth (see protect_discussion_answer_scores in schema.sql).
+  const { data, error } = await supabase.from('discussion_answers').update({
+    knowledge_score: scores.knowledge, reasoning_score: scores.reasoning, creativity_score: scores.creativity,
+    relevance_score: scores.relevance, communication_score: scores.communication, bonus_points: scores.bonus || 0,
+    feedback: scores.feedback || null,
+  }).eq('id', answerId).select().single();
+  if (error) throw error;
+  createNotification(data.user_id, 'answer_scored', `🧠 Your answer received ${data.total_score} points.`);
+  return data;
+}
+async function loadAnswersForRound(roundId){
+  const { data } = await supabase.from('discussion_answers').select('*, profiles(username,name,avatar_url)').eq('round_id', roundId).order('submitted_at');
+  return data || [];
+}
+
+/* -- leaderboard (always computed live from real answers, never stored) -- */
+async function loadDiscussionLeaderboard(roomId){
+  const { data } = await supabase.from('discussion_answers').select('user_id, total_score, content, profiles(username,name,avatar_url), discussion_rounds!inner(room_id)').eq('discussion_rounds.room_id', roomId);
+  const byUser = {};
+  (data||[]).forEach(a=>{
+    const u = byUser[a.user_id] ||= { user_id:a.user_id, profile:a.profiles, total:0, count:0, best:0 };
+    u.total += a.total_score || 0; u.count += 1; u.best = Math.max(u.best, a.total_score||0);
+  });
+  return Object.values(byUser).sort((a,b)=>b.total-a.total);
+}
+
+/* -- polls -- */
+async function createDiscussionPoll(roomId, question, options){
+  const { data: poll, error } = await supabase.from('discussion_polls').insert({ room_id: roomId, question, created_by: state.session.user.id }).select().single();
+  if (error) throw error;
+  const rows = options.map((label,i)=>({ poll_id: poll.id, label, position:i }));
+  const { error: optErr } = await supabase.from('discussion_poll_options').insert(rows);
+  if (optErr) throw optErr;
+  return poll;
+}
+async function voteOnPoll(pollId, optionId){
+  const { error } = await supabase.from('discussion_poll_votes').upsert({ poll_id: pollId, option_id: optionId, user_id: state.session.user.id });
+  if (error) throw error;
+}
+async function loadActivePolls(roomId){
+  const { data: polls } = await supabase.from('discussion_polls').select('*, discussion_poll_options(*)').eq('room_id', roomId).eq('is_active', true).order('created_at',{ ascending:false });
+  const withVotes = [];
+  for (const poll of (polls||[])){
+    const { data: votes } = await supabase.from('discussion_poll_votes').select('option_id, user_id').eq('poll_id', poll.id);
+    withVotes.push({ ...poll, votes: votes || [] });
+  }
+  return withVotes;
+}
+
+/* -- discussion chat (same shape as study-room chat) -- */
+async function loadDiscussionMessages(roomId){
+  const { data } = await supabase.from('discussion_messages').select('*, profiles(username,name,avatar_url,role)').eq('room_id', roomId).order('created_at',{ ascending:true }).limit(150);
+  state.discussionMessages = data || [];
+}
+async function sendDiscussionMessage(roomId, content){
+  const { data, error } = await supabase.from('discussion_messages').insert({ room_id: roomId, sender_id: state.session.user.id, content }).select('*, profiles(username,name,avatar_url,role)').single();
+  if (error) throw error;
+  return data;
+}
+async function pinDiscussionMessage(messageId, pinned){
+  const { error } = await supabase.from('discussion_messages').update({ pinned }).eq('id', messageId);
+  if (error) throw error;
+}
+function subscribeDiscussionChannel(roomId){
+  if (state.discussionChannel) supabase.removeChannel(state.discussionChannel);
+  state.discussionChannel = supabase.channel('discussion-'+roomId)
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'discussion_messages', filter:`room_id=eq.${roomId}` }, async payload => {
+      if (state.discussionMessages.some(m=>m.id===payload.new.id)) return;
+      const { data: prof } = await supabase.from('profiles').select('username,name,avatar_url,role').eq('id', payload.new.sender_id).single();
+      state.discussionMessages.push({ ...payload.new, profiles: prof });
+      if (state.view==='discussion' && state.activeDiscussionRoomId===roomId && state.discussionTab==='discussion') drawDiscussionMessages();
+    })
+    .on('postgres_changes', { event:'*', schema:'public', table:'discussion_rounds', filter:`room_id=eq.${roomId}` }, async () => {
+      state.discussionRounds = await loadDiscussionRounds(roomId);
+      if (state.view==='discussion' && state.activeDiscussionRoomId===roomId && state.discussionTab==='rounds') switchDiscussionTab('rounds');
+    })
+    .subscribe();
+}
+
+/* -- achievements -- */
+async function awardDiscussionWinners(roomId){
+  const { error } = await supabase.rpc('award_discussion_winners', { p_room_id: roomId });
+  if (error) throw error;
+  const achievements = await loadRoomAchievements(roomId);
+  achievements.forEach(a=>{
+    createNotification(a.user_id, 'discussion_award', `🏆 You won ${AWARD_LABELS[a.award_type]?.label || a.award_type} in a discussion room!`);
+  });
+}
+async function loadRoomAchievements(roomId){
+  const { data } = await supabase.from('discussion_achievements').select('*, profiles(username,name,avatar_url)').eq('room_id', roomId).order('awarded_at',{ ascending:false });
+  return data || [];
+}
+async function loadMyAchievements(){
+  if (!state.session) return [];
+  const { data } = await supabase.from('discussion_achievements').select('*').eq('user_id', state.session.user.id).order('awarded_at',{ ascending:false });
+  return data || [];
+}
+const AWARD_LABELS = {
+  champion:{ label:'Discussion Champion', emoji:'🏆' }, best_thinker:{ label:'Best Thinker', emoji:'🧠' },
+  most_creative:{ label:'Most Creative', emoji:'💡' }, knowledge_master:{ label:'Knowledge Master', emoji:'📚' },
+  best_communicator:{ label:'Best Communicator', emoji:'🗣' }, helpful_student:{ label:'Helpful Student', emoji:'🤝' },
+};
+const MEDAL_EMOJI = { bronze:'🥉', silver:'🥈', gold:'🥇', champion:'🏆', master_thinker:'🌟' };
+
 async function renderRooms(){
   const el = document.getElementById('view-rooms');
   if (!state.session){ el.innerHTML = `<div class="empty"><p>Log in to use Study Rooms.</p></div>`; return; }
@@ -2129,9 +2748,12 @@ async function renderRooms(){
 async function openCreateRoomModal(){
   const isAdmin = state.profile?.role === 'admin';
   let codes = [];
+  let mine = [];
   try{ codes = await fetchAvailableRoomCodes(); }catch(e){ codes = []; }
+  try{ mine = await fetchMyAssignedRoomCodes(); }catch(e){ mine = []; }
   const reserved = codes.filter(c=>c.is_admin_reserved);
   const vip = codes.filter(c=>!c.is_admin_reserved);
+  const vipLabel = c => (!isAdmin && Number(c.price) > 0) ? `₹${c.price} one-time · paid, assigned by admin` : `+₹${c.price} one-time`;
   openModal(`
     <div class="modal">
       <h3>Create a study room</h3>
@@ -2140,7 +2762,8 @@ async function openCreateRoomModal(){
       <select id="mrCode">
         <option value="">🎲 Random 6-digit number (free)</option>
         ${isAdmin ? reserved.map(c=>`<option value="${c.code}">👑 ${c.code} — Admin reserved</option>`).join('') : ''}
-        ${vip.map(c=>`<option value="${c.code}">✨ ${c.code} — VIP number (+₹${c.price} one-time)</option>`).join('')}
+        ${mine.map(c=>`<option value="${esc(c.code)}">✅ ${esc(c.code)} — Your VIP number</option>`).join('')}
+        ${vip.map(c=>`<option value="${c.code}">✨ ${c.code} — VIP number (${vipLabel(c)})</option>`).join('')}
       </select>
       ${isAdmin ? `
         <label style="display:flex;align-items:center;gap:8px;margin-top:10px;"><input type="checkbox" id="mrPremium" style="width:auto;margin:0;"> VIP room (you set the monthly price, subscribers only)</label>
@@ -2200,8 +2823,9 @@ async function inviteUserToRoom(roomId, username){
 async function openManageRoomModal(room){
   await loadRoomAccessRequests(room.id);
   const reqs = state.roomAccessRequests;
-  const members = await loadRoomMembers(room.id);
+  const subscriptions = await loadRoomSubscriptions(room.id);
   const allMembers = await loadAllRoomMembers(room.id);
+  const bans = await loadRoomBans(room.id);
   const myId = state.session.user.id;
   openModal(`
     <div class="modal">
@@ -2246,10 +2870,10 @@ async function openManageRoomModal(room){
             </div>`).join('')}
         </div>
       ` : ''}
-      ${room.is_premium && members.length ? `
+      ${room.is_premium && subscriptions.length ? `
         <p style="font-size:12px;font-weight:600;margin:14px 0 6px;">Subscribers</p>
         <div style="max-height:160px;overflow-y:auto;">
-          ${members.map(m=>{
+          ${subscriptions.map(m=>{
             const expired = m.expires_at && new Date(m.expires_at) < new Date();
             const daysLeft = m.expires_at ? Math.ceil((new Date(m.expires_at) - new Date())/86400000) : null;
             return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--hair);flex-wrap:wrap;">
@@ -2262,6 +2886,16 @@ async function openManageRoomModal(room){
           }).join('')}
         </div>
       ` : ''}
+      ${bans.length ? `
+        <p style="font-size:12px;font-weight:600;margin:14px 0 6px;">Blocked users</p>
+        <div style="max-height:160px;overflow-y:auto;">
+          ${bans.map(b=>`
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--hair);flex-wrap:wrap;">
+              <span style="font-size:13px;min-width:0;word-break:break-word;">${esc(b.profiles?.name || b.profiles?.username || 'Student')}</span>
+              <button class="btn btn-secondary btn-sm" data-unban="${b.user_id}">Unblock</button>
+            </div>`).join('')}
+        </div>
+      ` : ''}
       <div class="modal-actions"><button class="btn btn-secondary" id="cancelMg">Close</button><button class="btn btn-primary" id="saveMg">Save changes</button></div>
     </div>
   `);
@@ -2270,8 +2904,16 @@ async function openManageRoomModal(room){
     document.getElementById('mgPriceWrap').style.display = e.target.checked ? 'block' : 'none';
   });
   document.getElementById('mgLocked').addEventListener('change', async e=>{
-    await toggleRoomLock(room.id, e.target.checked);
-    toast(e.target.checked ? 'Room locked — no new joins' : 'Room unlocked');
+    const wantLocked = e.target.checked;
+    e.target.disabled = true;
+    try{
+      await toggleRoomLock(room.id, wantLocked);
+      toast(wantLocked ? 'Room locked — no new joins' : 'Room unlocked');
+    }catch(err){
+      e.target.checked = !wantLocked; // restore correct UI state on failure
+      toast(err.message || 'Could not update the lock — try again');
+    }
+    e.target.disabled = false;
   });
   document.querySelectorAll('[data-cohost]').forEach(b=>b.addEventListener('click', async ()=>{
     try{
@@ -2282,25 +2924,40 @@ async function openManageRoomModal(room){
   }));
   document.querySelectorAll('[data-remove]').forEach(b=>b.addEventListener('click', async ()=>{
     if (!confirm('Remove this person from the room?')) return;
-    await removeMember(room.id, b.dataset.remove);
-    toast('Removed from room');
+    try{
+      await removeMember(room.id, b.dataset.remove);
+      toast('Removed from room');
+    }catch(err){ toast(err.message || 'Could not remove that member'); }
     await openManageRoomModal(room);
   }));
   document.querySelectorAll('[data-block]').forEach(b=>b.addEventListener('click', async ()=>{
     if (!confirm('Block this person? They will not be able to rejoin with the room code.')) return;
-    await banMember(room.id, b.dataset.block);
-    toast('Blocked from room');
+    try{
+      await banMember(room.id, b.dataset.block);
+      toast('Blocked from room');
+    }catch(err){ toast(err.message || 'Could not block that member'); }
     await openManageRoomModal(room);
   }));
   document.querySelectorAll('[data-approve],[data-reject]').forEach(b=>b.addEventListener('click', async ()=>{
     const req = reqs.find(r=>r.id === (b.dataset.approve || b.dataset.reject));
-    await resolveRoomAccessRequest(req, !!b.dataset.approve);
-    toast(b.dataset.approve ? 'Access approved for 30 days' : 'Request rejected');
+    try{
+      await resolveRoomAccessRequest(req, !!b.dataset.approve);
+      toast(b.dataset.approve ? 'Access approved for 30 days' : 'Request rejected');
+    }catch(err){ toast(err.message || 'Could not process that request'); }
     await openManageRoomModal(room);
   }));
   document.querySelectorAll('[data-renew]').forEach(b=>b.addEventListener('click', async ()=>{
-    await renewRoomAccess(b.dataset.renew);
-    toast('Subscription renewed for 30 days');
+    try{
+      await renewRoomAccess(b.dataset.renew);
+      toast('Subscription renewed for 30 days');
+    }catch(err){ toast(err.message || 'Could not renew — try again'); }
+    await openManageRoomModal(room);
+  }));
+  document.querySelectorAll('[data-unban]').forEach(b=>b.addEventListener('click', async ()=>{
+    try{
+      await unbanMember(room.id, b.dataset.unban);
+      toast('Unblocked — they can request access again');
+    }catch(err){ toast(err.message || 'Could not unblock that user'); }
     await openManageRoomModal(room);
   }));
   document.getElementById('mgInviteBtn').addEventListener('click', async ()=>{
@@ -2309,17 +2966,22 @@ async function openManageRoomModal(room){
     try{ await inviteUserToRoom(room.id, username); toast(`${username} added to the room for free`); document.getElementById('mgInviteUsername').value=''; }
     catch(err){ toast(err.message); }
   });
-  document.getElementById('saveMg').addEventListener('click', async ()=>{
+  document.getElementById('saveMg').addEventListener('click', async e=>{
+    const btn = e.target;
     const isPremium = document.getElementById('mgPremium').checked;
     const price = document.getElementById('mgPrice')?.value || 0;
     const pinnedMessage = document.getElementById('mgPinned').value.trim();
+    btn.disabled = true; btn.textContent = 'Saving...';
     try{
       await updateRoomSettings(room.id, { isPremium, price, pinnedMessage });
       closeModal();
       await loadMyRooms();
       renderRoute();
       toast('Room updated');
-    }catch(err){ toast(err.message || 'Only admins can set a price'); }
+    }catch(err){
+      btn.disabled = false; btn.textContent = 'Save changes';
+      toast(err.message || 'Only admins can set a price');
+    }
   });
 }
 async function renderRoomChat(el){
@@ -2329,7 +2991,14 @@ async function renderRoomChat(el){
   const isHost = room.created_by === state.session.user.id;
   const members = await loadAllRoomMembers(room.id);
   state.roomMembersFull = members;
-  state.roomTab = (state.roomTab && state.roomTab !== 'call') ? state.roomTab : 'notes';
+  const studyTeacher = await loadStudyRoomTeacher(room.id);
+  room.teacher_id = studyTeacher?.teacher_id || null;
+  room.teacher_type = studyTeacher?.teacher_type || null;
+  room.bot_teacher_id = studyTeacher?.bot_teacher_id || null;
+  const canControl = canControlBoard(room);
+  const board = await loadRoomBoard(room.id);
+  state.roomTab = BOARD_TABS.includes(board?.active_tab) ? board.active_tab : 'whiteboard';
+  const controllerName = studyTeacher?.teacher_id ? 'Teacher' : 'Host';
 
   el.innerHTML = `
     <div class="room-dark">
@@ -2337,7 +3006,7 @@ async function renderRoomChat(el){
         <button class="rd-icon-btn" id="backToRooms">${ICONS.back}</button>
         <div class="rd-title">
           <p class="rd-name"><span class="rd-live-dot"></span>${esc(room.name)} ${room.is_premium?`<span class="rd-vip-pill">${ICONS.crown} VIP</span>`:''}${room.locked?`<span class="rd-locked-pill">🔒 Locked</span>`:''}</p>
-          <p class="rd-sub">Room #${room.room_code} · ${members.length} studying together</p>
+          <p class="rd-sub">Room #${room.room_code} · ${members.length} studying together${studyTeacher?.teacher_type==='bot' && getBotTeacher(studyTeacher.bot_teacher_id) ? ' · 🤖 '+esc(getBotTeacher(studyTeacher.bot_teacher_id).name) : (studyTeacher?.teacher_id ? ' · 👨‍🏫 Teacher' : '')}</p>
         </div>
         <div class="rd-header-actions">
           <span class="rd-timer" id="roomTimer" title="Time in this room">${ICONS.timer} 00:00</span>
@@ -2348,18 +3017,33 @@ async function renderRoomChat(el){
       ${room.pinned_message ? `<div class="rd-pinned"><span>📌</span><p>${esc(room.pinned_message)}</p></div>` : ''}
       <div class="rd-body">
         <div class="rd-main">
-          <div class="rd-tabs">
-            <button class="rd-tab" data-rtab="notes"><span class="rd-tab-icon">📝</span>Notes<small>Group notes</small></button>
-            <button class="rd-tab" data-rtab="whiteboard"><span class="rd-tab-icon">🖊</span>Whiteboard<small>Draw &amp; solve</small></button>
-            <button class="rd-tab" data-rtab="music"><span class="rd-tab-icon">🎵</span>Music<small>Study sounds</small></button>
-            <button class="rd-tab" data-rtab="tasks"><span class="rd-tab-icon">✅</span>Tasks<small>Stay focused</small></button>
+          <div class="rd-board ${canControl ? 'is-controller' : 'is-viewer'}">
+            <div class="rd-board-bar">
+              <div class="rd-board-tabs">
+                <button class="rd-tab" data-rtab="whiteboard" ${canControl?'':'disabled'}><span class="rd-tab-icon">🖊</span>Whiteboard</button>
+                <button class="rd-tab" data-rtab="notes" ${canControl?'':'disabled'}><span class="rd-tab-icon">📝</span>Notes</button>
+                <button class="rd-tab" data-rtab="music" ${canControl?'':'disabled'}><span class="rd-tab-icon">🎵</span>Music</button>
+                <button class="rd-tab" data-rtab="tasks" ${canControl?'':'disabled'}><span class="rd-tab-icon">✅</span>Tasks</button>
+                <button class="rd-tab" data-rtab="teacher" ${canControl?'':'disabled'}><span class="rd-tab-icon">👨‍🏫</span>Teacher</button>
+              </div>
+              <span class="rd-board-status">${canControl ? '🎓 Aap board chala rahe ho — sabko yahi dikhega' : `👀 ${controllerName} board chala rahe hain`}</span>
+            </div>
+            <div id="rdTabBody" class="rd-board-screen"></div>
           </div>
-          <div id="rdTabBody" class="rd-tab-body"></div>
         </div>
         <div class="rd-side">
-          <div class="rd-call-strip" id="rdCallStrip"></div>
+          <div class="rd-call-strip rd-class-video" id="rdCallStrip"></div>
           <div class="rd-chat-block">
-            <p class="rd-side-title">Room Chat</p>
+            <div class="rd-chat-head">
+              <p class="rd-side-title">Room Chat</p>
+              <details class="rd-people-toggle">
+                <summary>👥 ${members.length}</summary>
+                <div class="rd-people-pop">
+                  <p class="rd-side-title">Participants (${members.length})</p>
+                  <div id="rdParticipants"></div>
+                </div>
+              </details>
+            </div>
             <div id="roomMessages" class="rd-messages"></div>
             <div class="rd-composer">
               <button class="rd-file-btn" id="roomFileBtn" title="Attach a file">${ICONS.plus}</button>
@@ -2368,16 +3052,12 @@ async function renderRoomChat(el){
               <button class="rd-send-btn" id="roomSend">${ICONS.send}</button>
             </div>
           </div>
-          <div class="rd-participants-block">
-            <p class="rd-side-title">Participants (${members.length})</p>
-            <div id="rdParticipants"></div>
-          </div>
         </div>
       </div>
     </div>
   `;
   drawRoomMessages();
-  renderCallStrip(document.getElementById('rdCallStrip'), room);
+  renderCallStrip(document.getElementById('rdCallStrip'), room, 'study', { inline:true });
   renderParticipantsList(members, room);
 
   const timerEl = document.getElementById('roomTimer');
@@ -2392,10 +3072,19 @@ async function renderRoomChat(el){
 
   el.querySelector('#backToRooms').addEventListener('click', leaveRoomView);
   el.querySelector('#leaveRoomBtn').addEventListener('click', leaveRoomView);
-  function leaveRoomView(){ stopNoise(); if (state.call.active) endCall(); if (state.whiteboardChannel) supabase.removeChannel(state.whiteboardChannel); if (state.notesChannel) supabase.removeChannel(state.notesChannel); if (state.tasksChannel) supabase.removeChannel(state.tasksChannel); if (state.roomTimerInterval) clearInterval(state.roomTimerInterval); state.activeRoomId = null; renderRoute(); }
+  function leaveRoomView(){ stopNoise(); if (state.call.active) endCall(); if (state.whiteboardChannel) supabase.removeChannel(state.whiteboardChannel); if (state.notesChannel) supabase.removeChannel(state.notesChannel); if (state.tasksChannel) supabase.removeChannel(state.tasksChannel); if (state.boardChannel){ supabase.removeChannel(state.boardChannel); state.boardChannel = null; } if (state.roomTimerInterval) clearInterval(state.roomTimerInterval); state.activeRoomId = null; renderRoute(); }
   el.querySelector('#manageRoomBtn')?.addEventListener('click', ()=>openManageRoomModal(room));
 
-  el.querySelectorAll('.rd-tab').forEach(b=>b.addEventListener('click', ()=>switchRoomTab(b.dataset.rtab, room)));
+  // Only controllers can change what the board shows; the change is saved
+  // so every student's board follows along via subscribeRoomBoard.
+  if (canControl){
+    el.querySelectorAll('.rd-tab').forEach(b=>b.addEventListener('click', async ()=>{
+      const tab = b.dataset.rtab;
+      switchRoomTab(tab, room);
+      try{ await setRoomBoardTab(room.id, tab); }catch(err){ toast('Board sabke liye switch nahi hua — dobara try karo'); }
+    }));
+  }
+  subscribeRoomBoard(room.id, tab=>switchRoomTab(tab, room));
   switchRoomTab(state.roomTab, room);
 
   el.querySelector('#roomFileBtn').addEventListener('click', ()=>el.querySelector('#roomFileInput').click());
@@ -2406,7 +3095,7 @@ async function renderRoomChat(el){
     try{
       const url = await uploadRoomFile(file);
       await sendRoomMessage(room.id, `📎 ${file.name}\n${url}`);
-    }catch(err){ toast('Could not upload file — check the "attachments" storage bucket'); }
+    }catch(err){ toast(err.message || 'Could not upload file — check the "attachments" storage bucket'); }
     e.target.value = '';
   });
   el.querySelector('#roomSend').addEventListener('click', async ()=>{
@@ -2452,30 +3141,39 @@ function switchRoomTab(tab, room){
   document.querySelectorAll('.rd-tab').forEach(b=>b.classList.toggle('active', b.dataset.rtab===tab));
   const body = document.getElementById('rdTabBody');
   if (!body) return;
-  if (tab==='music') renderMusicTab(body, room);
-  else if (tab==='notes') renderNotesTab(body, room);
-  else if (tab==='whiteboard') renderWhiteboardTab(body, room);
-  else if (tab==='tasks') renderTasksTab(body, room);
+  const canControl = canControlBoard(room);
+  if (tab==='music') renderMusicTab(body, room, canControl);
+  else if (tab==='notes') renderNotesTab(body, room, canControl);
+  else if (tab==='whiteboard') renderWhiteboardTab(body, room, canControl);
+  else if (tab==='tasks') renderTasksTab(body, room, canControl);
+  else if (tab==='teacher') renderRoomTeacherTab(body, room, state.roomMembersFull || [], { canManage: room.created_by === state.session.user.id || state.profile?.role === 'admin' });
 }
 
-function renderCallStrip(body, room){
+// opts.inline: keep the call inside its panel (the study room's class-video
+// column) instead of jumping to full screen; a button still offers full screen.
+function renderCallStrip(body, room, roomType='study', opts={}){
+  const inline = !!opts.inline;
   body.innerHTML = `
-    <div class="call-panel" id="callPanelWrap">
+    <div class="call-panel ${inline ? 'call-panel-inline' : ''}" id="callPanelWrap">
       <button class="call-fs-close" id="callFsClose" title="Exit full screen">${ICONS.x}</button>
       <div class="call-panel-head">
-        <p class="rd-panel-title">🎥 Study call</p>
-        <button class="rd-btn rd-btn-primary btn-sm" id="startCallBtn">Start / join</button>
-        <button class="rd-btn rd-btn-danger btn-sm" id="leaveCallBtn" style="display:none;">Leave call</button>
+        <p class="rd-panel-title">🎥 ${inline ? 'Class video' : 'Study call'}</p>
+        <div style="display:flex;gap:6px;">
+          ${inline ? `<button class="rd-btn btn-sm" id="callFsBtn" title="Full screen" style="display:none;">⛶</button>` : ''}
+          <button class="rd-btn rd-btn-primary btn-sm" id="startCallBtn">Start / join</button>
+          <button class="rd-btn rd-btn-danger btn-sm" id="leaveCallBtn" style="display:none;">Leave call</button>
+        </div>
       </div>
-      <div id="jitsiContainer" class="jitsi-container"></div>
+      <div id="jitsiContainer" class="jitsi-container">${inline && !state.call.active ? `<div class="call-placeholder">📹<span>Class ki video call yahan dikhegi.<br>"Start / join" dabao.</span></div>` : ''}</div>
       <p class="rotate-hint">Tip: rotate your phone sideways for a full-screen view.</p>
     </div>
   `;
   renderCallButtons();
   body.querySelector('#startCallBtn').addEventListener('click', ()=>{
-    setCallFullscreen(true);
-    startCall(room.id, room);
+    if (!inline) setCallFullscreen(true);
+    startCall(room.id, room, roomType);
   });
+  body.querySelector('#callFsBtn')?.addEventListener('click', ()=>setCallFullscreen(true));
   body.querySelector('#leaveCallBtn')?.addEventListener('click', ()=>{ endCall(); setCallFullscreen(false); });
   body.querySelector('#callFsClose')?.addEventListener('click', ()=>setCallFullscreen(false));
 }
@@ -2497,7 +3195,7 @@ document.addEventListener('fullscreenchange', ()=>{
   }
 });
 
-function renderMusicTab(body, room){
+function renderMusicTab(body, room, canControl){
   body.innerHTML = `
     <div class="rd-panel">
       <p class="rd-panel-title">Focus sounds</p>
@@ -2512,18 +3210,19 @@ function renderMusicTab(body, room){
     <div class="rd-panel">
       <p class="rd-panel-title">🎵 Room jukebox</p>
       <div id="nowPlayingBox"></div>
+      ${canControl ? `
       <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
         <input id="ytLinkInput" class="rd-input" placeholder="Paste a YouTube song link..." style="flex:1;min-width:160px;">
         <button class="rd-btn rd-btn-primary" id="playForRoomBtn">Play for room</button>
-      </div>
-      <p style="font-size:11px;color:var(--rd-muted);margin-top:6px;">Anyone in the room can queue a song. Everyone taps "Join &amp; listen" to sync to it.</p>
+      </div>` : ''}
+      <p style="font-size:11px;color:var(--rd-muted);margin-top:6px;">${canControl ? 'Aap song lagao — students "Join &amp; listen" dabakar sync ho jayenge.' : 'Song teacher/host lagate hain. "Join &amp; listen" dabakar sath suno.'}</p>
     </div>
   `;
   drawNowPlaying();
   body.querySelectorAll('[data-noise]').forEach(b=>b.addEventListener('click', ()=>playNoise(b.dataset.noise)));
   body.querySelector('#stopNoiseBtn').addEventListener('click', stopNoise);
   body.querySelector('#noiseVolume').addEventListener('input', e=>{ if (state.noise.gain) state.noise.gain.gain.value = Number(e.target.value); });
-  body.querySelector('#playForRoomBtn').addEventListener('click', async ()=>{
+  body.querySelector('#playForRoomBtn')?.addEventListener('click', async ()=>{
     const inp = body.querySelector('#ytLinkInput');
     const val = inp.value.trim();
     if (!val) return;
@@ -2532,17 +3231,18 @@ function renderMusicTab(body, room){
   });
 }
 
-async function renderNotesTab(body, room){
+async function renderNotesTab(body, room, canControl){
   body.innerHTML = `
     <div class="rd-panel" style="height:100%;display:flex;flex-direction:column;">
-      <p class="rd-panel-title">📝 Shared notes — everyone in the room can edit</p>
-      <textarea id="roomNotesArea" class="rd-notes-area" placeholder="Start typing notes together..."></textarea>
-      <p id="notesSavedHint" style="font-size:11px;color:var(--rd-muted);margin-top:6px;">Saved automatically</p>
+      <p class="rd-panel-title">📝 ${canControl ? 'Board notes — aap jo likhoge, sabko live dikhega' : 'Board notes — teacher/host likh rahe hain'}</p>
+      <textarea id="roomNotesArea" class="rd-notes-area" placeholder="${canControl ? 'Class ke notes yahan likho...' : 'Abhi tak kuch nahi likha gaya'}" ${canControl ? '' : 'readonly'}></textarea>
+      ${canControl ? `<p id="notesSavedHint" style="font-size:11px;color:var(--rd-muted);margin-top:6px;">Saved automatically</p>` : ''}
     </div>
   `;
   const textarea = body.querySelector('#roomNotesArea');
   textarea.value = await loadRoomNotesText(room.id);
   subscribeRoomNotes(room.id, textarea);
+  if (!canControl) return;
   textarea.addEventListener('input', ()=>{
     document.getElementById('notesSavedHint').textContent = 'Saving...';
     clearTimeout(notesSaveTimer);
@@ -2554,22 +3254,24 @@ async function renderNotesTab(body, room){
   });
 }
 
-async function renderWhiteboardTab(body, room){
+async function renderWhiteboardTab(body, room, canControl){
   body.innerHTML = `
-    <div class="rd-panel" style="padding:10px;">
-      <div class="rd-wb-toolbar">
+    <div class="rd-panel rd-wb-panel" style="padding:10px;">
+      ${canControl ? '' : '<p class="rd-panel-title" style="margin-bottom:8px;">🖊 Teacher/host board par likh rahe hain</p>'}
+      <div class="rd-wb-toolbar" ${canControl ? '' : 'hidden'}>
         ${['#33E0FF','#B084F7','#FF5C8A','#FFD166','#5CFFB0','#FFFFFF'].map(c=>`<button class="rd-wb-color" data-color="${c}" style="background:${c};"></button>`).join('')}
         <input type="range" id="wbSize" min="1" max="12" value="3" style="width:70px;">
         <button class="rd-btn" id="wbEraser">Eraser</button>
         <button class="rd-btn rd-btn-danger" id="wbClear">Clear board</button>
       </div>
-      <canvas id="whiteboardCanvas" width="900" height="480" class="rd-whiteboard"></canvas>
+      <canvas id="whiteboardCanvas" width="1600" height="853" class="rd-whiteboard ${canControl ? '' : 'readonly'}"></canvas>
     </div>
   `;
   const canvas = body.querySelector('#whiteboardCanvas');
   const strokes = await loadWhiteboardStrokes(room.id);
   strokes.forEach(s=>drawStrokeOnCanvas(canvas, s));
   subscribeWhiteboard(room.id, canvas);
+  if (!canControl) return;
   setupWhiteboardCanvas(canvas, room.id);
   body.querySelectorAll('[data-color]').forEach(b=>b.addEventListener('click', ()=>{
     state.whiteboard.color = b.dataset.color;
@@ -2582,20 +3284,22 @@ async function renderWhiteboardTab(body, room){
   body.querySelector('#wbClear').addEventListener('click', async ()=>{ await clearWhiteboard(room.id); });
 }
 
-async function renderTasksTab(body, room){
+async function renderTasksTab(body, room, canControl){
   state.roomTasks = await loadRoomTasks(room.id);
-  subscribeRoomTasks(room.id, ()=>drawTasksList(body));
+  subscribeRoomTasks(room.id, ()=>drawTasksList(body, canControl));
   body.innerHTML = `
     <div class="rd-panel">
-      <p class="rd-panel-title">✅ Study tasks</p>
+      <p class="rd-panel-title">✅ ${canControl ? 'Class tasks' : 'Class tasks — teacher/host set karte hain'}</p>
+      ${canControl ? `
       <div style="display:flex;gap:8px;margin-bottom:12px;">
         <input id="newTaskInput" class="rd-input" placeholder="Add a task, e.g. Finish Chapter 4" style="flex:1;">
         <button class="rd-btn rd-btn-primary" id="addTaskBtn">Add</button>
-      </div>
+      </div>` : ''}
       <div id="tasksList"></div>
     </div>
   `;
-  drawTasksList(body);
+  drawTasksList(body, canControl);
+  if (!canControl) return;
   body.querySelector('#addTaskBtn').addEventListener('click', async ()=>{
     const inp = body.querySelector('#newTaskInput');
     const val = inp.value.trim();
@@ -2604,22 +3308,24 @@ async function renderTasksTab(body, room){
     try{ await addRoomTask(room.id, val); }catch(e){ toast('Could not add task'); }
   });
 }
-function drawTasksList(body){
+function drawTasksList(body, canControl){
   const wrap = body.querySelector('#tasksList');
   if (!wrap) return;
   wrap.innerHTML = state.roomTasks.length ? state.roomTasks.map(t=>`
     <div class="rd-task-row">
-      <label style="display:flex;align-items:center;gap:8px;flex:1;cursor:pointer;">
-        <input type="checkbox" data-toggle-task="${t.id}" ${t.is_done?'checked':''}>
+      <label style="display:flex;align-items:center;gap:8px;flex:1;cursor:${canControl?'pointer':'default'};">
+        <input type="checkbox" data-toggle-task="${t.id}" ${t.is_done?'checked':''} ${canControl?'':'disabled'}>
         <span style="${t.is_done?'text-decoration:line-through;color:var(--rd-muted);':''}">${esc(t.content)}</span>
       </label>
-      <button class="rd-icon-btn small" data-del-task="${t.id}">${ICONS.x}</button>
-    </div>`).join('') : `<p style="font-size:12.5px;color:var(--rd-muted);">No tasks yet — add one above.</p>`;
+      ${canControl ? `<button class="rd-icon-btn small" data-del-task="${t.id}">${ICONS.x}</button>` : ''}
+    </div>`).join('') : `<p style="font-size:12.5px;color:var(--rd-muted);">${canControl ? 'No tasks yet — add one above.' : 'Abhi koi task nahi diya gaya.'}</p>`;
+  if (!canControl) return;
   wrap.querySelectorAll('[data-toggle-task]').forEach(cb=>cb.addEventListener('change', e=>toggleRoomTask(e.target.dataset.toggleTask, e.target.checked)));
   wrap.querySelectorAll('[data-del-task]').forEach(b=>b.addEventListener('click', ()=>deleteRoomTask(b.dataset.delTask)));
 }
 
 async function uploadRoomFile(file){
+  validateUpload(file, ['pdf','png','jpg','jpeg','webp','doc','docx','ppt','pptx']);
   const ext = (file.name.split('.').pop() || 'pdf').toLowerCase();
   const path = `room-files/${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`;
   const { error } = await supabase.storage.from('attachments').upload(path, file, { upsert:true });
@@ -2655,6 +3361,658 @@ function drawNowPlaying(){
     const elapsed = Math.max(0, Math.floor((Date.now() - new Date(np.started_at).getTime())/1000));
     box.querySelector('#ytPlayerWrap').innerHTML = `<iframe width="100%" height="180" style="border-radius:10px;border:none;display:block;" src="https://www.youtube.com/embed/${np.video_id}?start=${elapsed}&autoplay=1" title="${esc(np.title)}" allow="autoplay; encrypted-media" allowfullscreen></iframe>`;
   });
+}
+
+
+/* ---- Room Teachers: human + built-in AI teacher bots ---- */
+const BUILTIN_TEACHERS = [
+  { id:'atlas', name:'Atlas AI Teacher', subjects:'Science • Biology • Physics', icon:'🔬',
+    intro:'I teach step-by-step and explain the reason behind the answer.' },
+  { id:'arya', name:'Arya AI Teacher', subjects:'Mathematics • Reasoning', icon:'📐',
+    intro:'I break problems into small steps and check the logic.' },
+  { id:'nova', name:'Nova AI Teacher', subjects:'English • Languages', icon:'📚',
+    intro:'I explain grammar, vocabulary and writing with examples.' },
+  { id:'mentor', name:'Mentor AI Teacher', subjects:'General Study • Exams', icon:'🎓',
+    intro:'I help with concepts, revision plans and exam-style questions.' }
+];
+
+function getBotTeacher(id){ return BUILTIN_TEACHERS.find(t=>t.id===id) || null; }
+
+async function loadStudyRoomTeacher(roomId){
+  const { data, error } = await supabase.from('study_rooms')
+    .select('teacher_id,teacher_type,bot_teacher_id')
+    .eq('id', roomId).maybeSingle();
+  if (error) { console.warn('[teacher] study room teacher load failed', error); return null; }
+  return data;
+}
+
+async function saveRoomTeacher(table, roomId, patch){
+  const { error } = await supabase.from(table).update(patch).eq('id', roomId);
+  if (error) throw error;
+}
+
+async function appointStudyTeacher(roomId, type, id){
+  if (type === 'bot'){
+    await saveRoomTeacher('study_rooms', roomId, { teacher_id:null, teacher_type:'bot', bot_teacher_id:id });
+    return;
+  }
+  await saveRoomTeacher('study_rooms', roomId, { teacher_id:id, teacher_type:'human', bot_teacher_id:null });
+  await supabase.from('study_room_members').upsert({room_id:roomId,user_id:id});
+}
+
+async function removeStudyTeacher(roomId){
+  await saveRoomTeacher('study_rooms', roomId, { teacher_id:null, teacher_type:null, bot_teacher_id:null });
+}
+
+function teacherDisplay(room){
+  if (room.teacher_type === 'bot' && getBotTeacher(room.bot_teacher_id)) return getBotTeacher(room.bot_teacher_id);
+  if (room.teacher_id){
+    const m = (state.roomMembersFull||[]).find(x=>x.user_id===room.teacher_id);
+    if (m) return { id:m.user_id, name:m.profiles?.name||m.profiles?.username||'Teacher', subjects:'Appointed teacher', icon:'👨‍🏫', human:true };
+  }
+  return null;
+}
+
+function teacherAnswer(bot, question){
+  const q = question.trim();
+  if (!q) return 'Question likho — main step-by-step explain karunga.';
+  const lower = q.toLowerCase();
+  if (/(hello|hi|hey|namaste|नमस्ते)/i.test(lower))
+    return `Namaste! Main ${bot.name} hoon. Apna topic ya question bhejo; main concept, example aur short revision point ke saath samjhaunga.`;
+  if (/(formula|equation|solve|calculate|numerical|hisab)/i.test(lower))
+    return `Chalo isse step-by-step karte hain:\n1) Given values/conditions likho.\n2) Relevant formula ya rule identify karo.\n3) Values substitute karo.\n4) Units/check aur final answer verify karo.\n\nExact numerical bhejoge to main usi question ke steps structure kar dunga.`;
+  if (/(define|meaning|what is|kya hai|explain|samjha)/i.test(lower))
+    return `Concept ko simple language mein samjho:\n• Definition: ${q}\n• Core idea: pehle basic principle identify karo.\n• Example: real-life/example case se relate karo.\n• Exam point: definition + key property + example revise karo.\n\nAgar tum subject aur class/exam bata do, explanation ko us level par tailor kiya ja sakta hai.`;
+  return `Good question. Isko solve karne ke liye pehle question ke key facts identify karo, phir relevant concept/rule apply karo. Agar tum question ka exact text, subject aur class/exam bhej do, main step-by-step explanation aur practice question de sakta hoon.`;
+}
+
+function renderRoomTeacherTab(body, room, members, perms){
+  const current = teacherDisplay(room);
+  body.innerHTML = `
+    <div class="rd-panel">
+      <p class="rd-panel-title">👨‍🏫 Room Teacher</p>
+      ${current ? `
+        <div style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--rd-border);border-radius:10px;">
+          <div style="font-size:28px;">${current.icon||'👨‍🏫'}</div>
+          <div style="flex:1"><b style="color:var(--rd-text)">${esc(current.name)}</b><div style="font-size:12px;color:var(--rd-muted);">${esc(current.subjects||'Teacher')}</div></div>
+          ${perms.canManage ? `<button class="rd-btn rd-btn-danger btn-sm" id="removeRoomTeacher">Remove</button>` : ''}
+        </div>` : `<p style="color:var(--rd-muted);font-size:13px;">No teacher appointed yet.</p>`}
+    </div>
+    ${perms.canManage ? `
+    <div class="rd-panel">
+      <p class="rd-panel-title">Appoint Human Teacher</p>
+      <input id="roomTeacherSearch" class="rd-input" placeholder="Search by name or username..." style="width:100%;">
+      <div id="roomTeacherResults" style="margin-top:10px;"></div>
+    </div>
+    <div class="rd-panel">
+      <p class="rd-panel-title">🤖 Appoint AI Teacher Bot</p>
+      <div style="display:grid;gap:8px;">
+        ${BUILTIN_TEACHERS.map(b=>`<button class="rd-btn" data-bot-teacher="${b.id}" style="text-align:left;">
+          ${b.icon} <b>${esc(b.name)}</b><br><small style="color:var(--rd-muted);margin-left:26px;">${esc(b.subjects)}</small>
+        </button>`).join('')}
+      </div>
+    </div>` : ''}
+    ${current && !current.human ? `
+    <div class="rd-panel">
+      <p class="rd-panel-title">💬 Ask ${esc(current.name)}</p>
+      <textarea id="botQuestion" rows="3" class="rd-input" style="width:100%;resize:vertical;" placeholder="Apna sawaal likho..."></textarea>
+      <button class="rd-btn rd-btn-primary" id="askBotBtn" style="margin-top:8px;">Ask Teacher</button>
+      <div id="botAnswer" style="margin-top:12px;white-space:pre-wrap;color:var(--rd-text);font-size:13px;"></div>
+    </div>` : ''}
+  `;
+  body.querySelector('#removeRoomTeacher')?.addEventListener('click', async()=>{
+    try{
+      if (room.id) {
+        const isStudy = state.activeRoomId === room.id;
+        if (isStudy) await removeStudyTeacher(room.id); else if (state.activeDiscussionRoomId === room.id) { const {error}=await supabase.from('discussion_rooms').update({teacher_id:null,teacher_type:null,bot_teacher_id:null}).eq('id',room.id); if(error) throw error; }
+        room.teacher_id=null; room.teacher_type=null; room.bot_teacher_id=null;
+        renderRoomTeacherTab(body, room, members, perms);
+        toast('Teacher removed');
+      }
+    }catch(err){ toast(err.message||'Could not remove teacher'); }
+  });
+  body.querySelectorAll('[data-bot-teacher]').forEach(btn=>btn.addEventListener('click', async()=>{
+    try{
+      const botId=btn.dataset.botTeacher;
+      if (state.activeRoomId === room.id) await appointStudyTeacher(room.id,'bot',botId);
+      else if (state.activeDiscussionRoomId === room.id) { const {error}=await supabase.from('discussion_rooms').update({teacher_id:null,teacher_type:'bot',bot_teacher_id:botId}).eq('id',room.id); if(error) throw error; }
+      room.teacher_id=null; room.teacher_type='bot'; room.bot_teacher_id=botId;
+      renderRoomTeacherTab(body, room, members, perms);
+      toast('AI teacher appointed');
+    }catch(err){ toast(err.message||'Could not appoint AI teacher'); }
+  }));
+  const input=body.querySelector('#roomTeacherSearch');
+  const results=body.querySelector('#roomTeacherResults');
+  let timer;
+  input?.addEventListener('input',()=>{
+    clearTimeout(timer);
+    timer=setTimeout(async()=>{
+      const q=input.value.trim();
+      if(q.length<2){results.innerHTML='';return;}
+      const users=await searchUsersByName(q);
+      results.innerHTML=users.map(u=>`<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--rd-border);">
+        <div class="avatar sm">${avatarInner(u)}</div><span style="flex:1;color:var(--rd-text);">${esc(u.name||u.username)}</span>
+        <button class="rd-btn btn-sm" data-human-teacher="${u.id}">Appoint</button></div>`).join('') || '<p style="font-size:12px;color:var(--rd-muted);">No users found.</p>';
+      results.querySelectorAll('[data-human-teacher]').forEach(b=>b.addEventListener('click',async()=>{
+        try{
+          if(state.activeRoomId===room.id) await appointStudyTeacher(room.id,'human',b.dataset.humanTeacher);
+          else { const {error}=await supabase.from('discussion_rooms').update({teacher_id:b.dataset.humanTeacher,teacher_type:'human',bot_teacher_id:null}).eq('id',room.id); if(error) throw error; await supabase.from('discussion_room_members').upsert({room_id:room.id,user_id:b.dataset.humanTeacher}); }
+          room.teacher_id=b.dataset.humanTeacher; room.teacher_type='human'; room.bot_teacher_id=null;
+          renderRoomTeacherTab(body,room,members,perms); toast('Teacher appointed');
+        }catch(err){toast(err.message||'Could not appoint teacher');}
+      }));
+    },300);
+  });
+  body.querySelector('#askBotBtn')?.addEventListener('click',()=>{
+    const q=body.querySelector('#botQuestion').value;
+    const bot=getBotTeacher(room.bot_teacher_id);
+    body.querySelector('#botAnswer').textContent=bot ? teacherAnswer(bot,q) : 'No AI teacher selected.';
+  });
+}
+
+/* ---- Discussion Rooms UI ---- */
+async function renderDiscussionRooms(){
+  const el = document.getElementById('view-discussion');
+  if (!state.session){ el.innerHTML = `<div class="empty"><p>Log in to use Discussion Rooms.</p></div>`; return; }
+  if (state.activeDiscussionRoomId){ await renderDiscussionRoomDetail(el); return; }
+  el.innerHTML = `
+    <div class="section-head"><h2>Discussion Rooms</h2></div>
+    <p style="font-size:12px;color:var(--ink-faint);margin:-10px 0 16px;">Debate a topic, take turns answering, get scored, and climb the leaderboard.</p>
+    <div class="room-join-bar">
+      <button class="btn btn-primary btn-sm" id="createDiscussionBtn">${ICONS.plus} Create a room</button>
+      <div class="room-join-input"><span>#</span><input id="discJoinCode" placeholder="Enter Room ID e.g. DR-2026-0001"></div>
+      <button class="btn btn-secondary btn-sm" id="discJoinBtn">Join</button>
+    </div>
+    <div id="discRoomsList" class="room-grid"></div>
+  `;
+  document.getElementById('createDiscussionBtn').addEventListener('click', openCreateDiscussionRoomModal);
+  document.getElementById('discJoinBtn').addEventListener('click', async ()=>{
+    const code = document.getElementById('discJoinCode').value.trim();
+    if (!code){ toast('Enter a room ID'); return; }
+    try{ await joinDiscussionRoomByCode(code); await loadMyDiscussionRooms(); renderRoute(); toast('Joined the discussion room'); }
+    catch(err){ toast(err.message); }
+  });
+  const list = el.querySelector('#discRoomsList');
+  const banners = ['rb-indigo','rb-amber','rb-green','rb-coral','rb-grape'];
+  list.innerHTML = state.discussionRooms.length ? state.discussionRooms.map((r,i)=>{
+    const isHost = r.host_id === state.session.user.id;
+    const isTeacher = r.teacher_id === state.session.user.id;
+    return `
+    <div class="room-card" data-disc-room="${r.id}">
+      <div class="room-card-banner ${banners[i%banners.length]}">
+        <span class="room-vip-badge">${ICONS.debate} ${r.status==='live'?'LIVE':r.status==='ended'?'Ended':'Open'}</span>
+        <span class="room-card-emoji">🎓</span>
+      </div>
+      <div class="room-card-body">
+        <p class="room-card-title">${esc(r.name)}</p>
+        <div class="room-card-code">${r.room_code}</div>
+        <p class="room-card-meta">${isHost?'You are the host':isTeacher?'You are the teacher':esc(r.description||'')}</p>
+        <div class="room-card-actions"><button class="btn btn-primary btn-sm" data-enter-disc="${r.id}" style="flex:1;justify-content:center;">Enter</button></div>
+      </div>
+    </div>`;
+  }).join('') : `<div class="empty"><p>No discussion rooms yet. Create one or join with a Room ID.</p></div>`;
+  list.querySelectorAll('[data-enter-disc]').forEach(b=>b.addEventListener('click', async ()=>{
+    state.activeDiscussionRoomId = b.dataset.enterDisc;
+    state.discussionTab = 'discussion';
+    renderRoute();
+  }));
+}
+function openCreateDiscussionRoomModal(){
+  openModal(`
+    <div class="modal">
+      <h3>Create a Discussion Room</h3>
+      <label>Room name</label><input id="drName" placeholder="e.g. Physics Debate Club">
+      <label>Subject</label><select id="drSubject"><option value="">General</option>${state.subjects.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select>
+      <label>Description</label><textarea id="drDesc" rows="2" placeholder="What is this room about?"></textarea>
+      <label>Max members</label><input id="drMax" type="number" min="2" max="200" value="30">
+      <label>Privacy</label>
+      <select id="drPrivacy"><option value="public">Public — anyone can join</option><option value="invite_only">Invite only — join by Room ID only</option></select>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:8px;"><input type="checkbox" id="drScoring" checked style="width:auto;margin:0;"> Enable scoring</label>
+      <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="drLeaderboard" checked style="width:auto;margin:0;"> Enable leaderboard</label>
+      <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="drMedals" checked style="width:auto;margin:0;"> Enable medals/achievements</label>
+      <div class="modal-actions"><button class="btn btn-secondary" id="cancelDr">Cancel</button><button class="btn btn-primary" id="saveDr">Create Room</button></div>
+    </div>
+  `);
+  document.getElementById('cancelDr').addEventListener('click', closeModal);
+  document.getElementById('saveDr').addEventListener('click', async e=>{
+    const name = document.getElementById('drName').value.trim();
+    if (!name){ toast('Give the room a name'); return; }
+    const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Creating...';
+    try{
+      const room = await createDiscussionRoom({
+        name, description: document.getElementById('drDesc').value.trim(),
+        subjectId: document.getElementById('drSubject').value || null,
+        maxMembers: Number(document.getElementById('drMax').value) || 30,
+        privacy: document.getElementById('drPrivacy').value,
+        scoringEnabled: document.getElementById('drScoring').checked,
+        leaderboardEnabled: document.getElementById('drLeaderboard').checked,
+        medalsEnabled: document.getElementById('drMedals').checked,
+      });
+      closeModal();
+      toast(`Room created — ID: ${room.room_code}`);
+      await loadMyDiscussionRooms();
+      state.activeDiscussionRoomId = room.id;
+      renderRoute();
+    }catch(err){ btn.disabled = false; btn.textContent = 'Create Room'; toast(err.message || 'Could not create room'); }
+  });
+}
+
+async function renderDiscussionRoomDetail(el){
+  const room = state.discussionRooms.find(r=>r.id===state.activeDiscussionRoomId);
+  if (!room){ state.activeDiscussionRoomId = null; return renderDiscussionRooms(); }
+  const isHost = room.host_id === state.session.user.id;
+  const isTeacher = room.teacher_id === state.session.user.id;
+  const isAdmin = state.profile?.role === 'admin';
+  const canManage = isHost || isAdmin;
+  const canModerate = canManage || isTeacher;
+  const members = await loadDiscussionRoomMembers(room.id);
+  state.discussionActiveTopic = await loadActiveTopic(room.id);
+
+  el.innerHTML = `
+    <div class="room-dark">
+      <div class="rd-header">
+        <button class="rd-icon-btn" id="backToDisc">${ICONS.back}</button>
+        <div class="rd-title">
+          <p class="rd-name"><span class="rd-live-dot"></span>${esc(room.name)} <span class="rd-vip-pill" style="background:linear-gradient(135deg,#4C6FFF,#2A46C9);">${room.room_code}</span></p>
+          <p class="rd-sub">${members.length}/${room.max_members} members · Host: ${esc(members.find(m=>m.user_id===room.host_id)?.profiles?.name || 'Unknown')}${room.teacher_id ? ' · Teacher: '+esc(members.find(m=>m.user_id===room.teacher_id)?.profiles?.name || '—') : ''}</p>
+        </div>
+        <div class="rd-header-actions">
+          <button class="rd-icon-btn" id="raiseHandBtn" title="Raise hand">${ICONS.hand}</button>
+          ${canManage ? `<button class="rd-icon-btn" id="endDiscussionBtn" title="End discussion &amp; announce winners">${ICONS.crown}</button>` : ''}
+          <button class="rd-leave-btn" id="leaveDiscBtn">Leave Room</button>
+        </div>
+      </div>
+      <div class="rd-tabs">
+        <button class="rd-tab" data-dtab="discussion">💬 Discussion</button>
+        <button class="rd-tab" data-dtab="topic">📋 Topic</button>
+        <button class="rd-tab" data-dtab="rounds">🎯 Rounds</button>
+        <button class="rd-tab" data-dtab="polls">📊 Polls</button>
+        <button class="rd-tab" data-dtab="leaderboard">🏆 Leaderboard</button>
+        <button class="rd-tab" data-dtab="teacher">👨‍🏫 Teacher</button>
+        <button class="rd-tab" data-dtab="rules">📜 Rules</button>
+        <button class="rd-tab" data-dtab="call">🎥 Call</button>
+      </div>
+      <div id="dTabBody" class="rd-tab-body"></div>
+    </div>
+  `;
+  loadDiscussionMessages(room.id).then(()=>{ if (state.discussionTab==='discussion') drawDiscussionMessages(); });
+  subscribeDiscussionChannel(room.id);
+
+  el.querySelector('#backToDisc').addEventListener('click', ()=>{
+    if (state.discussionChannel){ supabase.removeChannel(state.discussionChannel); state.discussionChannel=null; }
+    if (state.call.active) endCall();
+    state.activeDiscussionRoomId = null;
+    renderRoute();
+  });
+  el.querySelector('#leaveDiscBtn').addEventListener('click', ()=>el.querySelector('#backToDisc').click());
+  el.querySelector('#raiseHandBtn').addEventListener('click', async e=>{
+    const me = members.find(m=>m.user_id===state.session.user.id);
+    const nowRaised = !(me?.hand_raised);
+    try{ await toggleRaiseHand(room.id, nowRaised); toast(nowRaised ? '✋ Hand raised — the teacher can see you' : 'Hand lowered'); e.currentTarget.classList.toggle('active', nowRaised); }
+    catch(err){ toast(err.message); }
+  });
+  el.querySelector('#endDiscussionBtn')?.addEventListener('click', ()=>{
+    openModal(`
+      <div class="modal">
+        <h3>End this discussion?</h3>
+        <p>This calculates winners from every scored answer so far and awards medals. This can't be undone.</p>
+        <div class="modal-actions"><button class="btn btn-secondary" id="cancelEnd">Cancel</button><button class="btn btn-danger" id="confirmEnd">End &amp; Announce Winners</button></div>
+      </div>
+    `);
+    document.getElementById('cancelEnd').addEventListener('click', closeModal);
+    document.getElementById('confirmEnd').addEventListener('click', async ()=>{
+      try{
+        await awardDiscussionWinners(room.id);
+        closeModal();
+        await showWinnerCelebration(room);
+        await loadMyDiscussionRooms();
+      }catch(err){ toast(err.message || 'Could not finalize the discussion'); }
+    });
+  });
+  el.querySelectorAll('.rd-tab').forEach(b=>b.addEventListener('click', ()=>switchDiscussionTab(b.dataset.dtab, room, members, { isHost, isTeacher, isAdmin, canManage, canModerate })));
+  switchDiscussionTab(state.discussionTab, room, members, { isHost, isTeacher, isAdmin, canManage, canModerate });
+}
+
+function switchDiscussionTab(tab, room, members, perms){
+  state.discussionTab = tab;
+  document.querySelectorAll('.rd-tab').forEach(b=>b.classList.toggle('active', b.dataset.dtab===tab));
+  const body = document.getElementById('dTabBody');
+  if (!body) return;
+  if (tab==='discussion') renderDiscussionChatTab(body, room, perms);
+  else if (tab==='topic') renderTopicTab(body, room, perms);
+  else if (tab==='rounds') renderRoundsTab(body, room, members, perms);
+  else if (tab==='polls') renderPollsTab(body, room, perms);
+  else if (tab==='leaderboard') renderLeaderboardTab(body, room);
+  else if (tab==='teacher') renderTeacherTab(body, room, members, perms);
+  else if (tab==='rules') renderRulesTab(body, room, perms);
+  else if (tab==='call') renderCallStrip(body, room, 'discussion');
+}
+
+function renderDiscussionChatTab(body, room, perms){
+  body.innerHTML = `
+    <div id="discussionMessages" class="rd-panel chat-appearance-scope" style="min-height:340px;max-height:440px;overflow-y:auto;"></div>
+    <div class="rd-composer" style="margin-top:10px;">
+      <textarea rows="1" id="discInput" placeholder="Share your thoughts..."></textarea>
+      <button class="rd-send-btn" id="discSend">${ICONS.send}</button>
+    </div>
+  `;
+  drawDiscussionMessages();
+  body.querySelector('#discSend').addEventListener('click', async ()=>{
+    const inp = body.querySelector('#discInput');
+    const val = inp.value.trim();
+    if (!val) return;
+    inp.value = '';
+    const tempId = 'temp-'+Date.now();
+    state.discussionMessages.push({ id:tempId, room_id:room.id, sender_id:state.session.user.id, content:val, created_at:new Date().toISOString(), profiles:state.profile, pending:true });
+    drawDiscussionMessages();
+    try{
+      const real = await sendDiscussionMessage(room.id, val);
+      const i = state.discussionMessages.findIndex(m=>m.id===tempId);
+      if (i>-1) state.discussionMessages[i] = real;
+      drawDiscussionMessages();
+    }catch(err){
+      state.discussionMessages = state.discussionMessages.filter(m=>m.id!==tempId);
+      drawDiscussionMessages(); inp.value = val;
+      toast('Message failed to send');
+    }
+  });
+}
+function drawDiscussionMessages(){
+  const wrap = document.getElementById('discussionMessages');
+  if (!wrap) return;
+  wrap.innerHTML = state.discussionMessages.length ? chatBubblesHTML(state.discussionMessages, state.session.user.id, { idKey:'sender_id' }) : `<div class="empty"><p>No messages yet — start the discussion!</p></div>`;
+  wrap.querySelectorAll('[data-viewprofile]').forEach(n=>n.addEventListener('click', ()=>openUserProfileModal(n.dataset.viewprofile)));
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function renderTopicTab(body, room, perms){
+  const t = state.discussionActiveTopic;
+  body.innerHTML = `
+    <div class="rd-panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <p class="rd-panel-title">📋 Topic Board</p>
+        ${perms.canModerate ? `<button class="rd-btn rd-btn-primary btn-sm" id="newTopicBtn">+ New Topic</button>` : ''}
+      </div>
+      ${t ? `
+        <h3 style="font-family:var(--font-display);color:var(--rd-text);font-size:19px;margin:10px 0 6px;">${esc(t.title)}</h3>
+        <p style="color:var(--rd-muted);font-size:13.5px;line-height:1.6;">${esc(t.description||'')}</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+          <span class="tag">Difficulty: ${esc(t.difficulty)}</span>
+          <span class="tag">${t.discussion_minutes} min</span>
+        </div>
+        ${t.image_url ? `<img src="${esc(t.image_url)}" style="max-width:100%;border-radius:12px;margin-top:12px;">` : ''}
+        ${t.file_url ? `<a href="${esc(t.file_url)}" target="_blank" rel="noopener noreferrer" class="rd-btn btn-sm" style="display:inline-block;margin-top:10px;">📎 Open attached file</a>` : ''}
+      ` : `<p style="color:var(--rd-muted);font-size:13px;margin-top:10px;">No topic published yet.</p>`}
+    </div>
+  `;
+  body.querySelector('#newTopicBtn')?.addEventListener('click', ()=>openNewTopicModal(room));
+}
+function openNewTopicModal(room){
+  openModal(`
+    <div class="modal">
+      <h3>Publish a new topic</h3>
+      <label>Title</label><input id="tpTitle" placeholder="e.g. Can Nuclear Energy Be the Future?">
+      <label>Description</label><textarea id="tpDesc" rows="3"></textarea>
+      <label>Difficulty</label><select id="tpDiff"><option value="easy">Easy</option><option value="medium" selected>Medium</option><option value="hard">Hard</option></select>
+      <label>Discussion length (minutes)</label><input id="tpMinutes" type="number" value="20" min="5" max="120">
+      <label>Diagram/image (optional)</label><input type="file" id="tpImage" accept="image/*">
+      <label>File attachment — PDF, slides, etc. (optional)</label><input type="file" id="tpFile" accept=".pdf,.doc,.docx,.ppt,.pptx">
+      <div class="modal-actions"><button class="btn btn-secondary" id="cancelTp">Cancel</button><button class="btn btn-primary" id="saveTp">Publish</button></div>
+    </div>
+  `);
+  document.getElementById('cancelTp').addEventListener('click', closeModal);
+  document.getElementById('saveTp').addEventListener('click', async e=>{
+    const title = document.getElementById('tpTitle').value.trim();
+    if (!title){ toast('Give the topic a title'); return; }
+    const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Publishing...';
+    try{
+      let imageUrl = null, fileUrl = null;
+      const imgFile = document.getElementById('tpImage').files[0];
+      if (imgFile) imageUrl = await uploadRoomFile(imgFile);
+      const docFile = document.getElementById('tpFile').files[0];
+      if (docFile) fileUrl = await uploadRoomFile(docFile);
+      await createDiscussionTopic(room.id, {
+        title, description: document.getElementById('tpDesc').value.trim(),
+        difficulty: document.getElementById('tpDiff').value, minutes: Number(document.getElementById('tpMinutes').value),
+        imageUrl, fileUrl,
+      });
+      closeModal(); toast('Topic published');
+      state.discussionActiveTopic = await loadActiveTopic(room.id);
+      switchDiscussionTab('topic', room, await loadDiscussionRoomMembers(room.id), {});
+    }catch(err){ btn.disabled=false; btn.textContent='Publish'; toast(err.message || 'Could not publish topic'); }
+  });
+}
+
+function renderRoundsTab(body, room, members, perms){
+  body.innerHTML = `<div id="roundsBody"></div>`;
+  refreshRoundsTab();
+  async function refreshRoundsTab(){
+    state.discussionRounds = await loadDiscussionRounds(room.id);
+    const active = state.discussionRounds.find(r=>r.status==='active');
+    const wrap = body.querySelector('#roundsBody');
+    wrap.innerHTML = `
+      ${perms.canModerate ? `
+      <div class="rd-panel">
+        <p class="rd-panel-title">🎯 Start a new round</p>
+        <select id="roundType">
+          <option value="knowledge">Round 1 — Knowledge</option>
+          <option value="thinking">Round 2 — Thinking</option>
+          <option value="advice">Round 3 — Advice</option>
+          <option value="challenge">Round 4 — Challenge</option>
+          <option value="final">Round 5 — Final Thought</option>
+        </select>
+        <input id="roundQuestion" placeholder="Custom question (optional — a default is used otherwise)" style="margin-top:8px;">
+        <select id="roundTimer" style="margin-top:8px;"><option value="30">30 seconds</option><option value="60" selected>60 seconds</option><option value="90">90 seconds</option><option value="120">2 minutes</option><option value="300">5 minutes</option></select>
+        <button class="rd-btn rd-btn-primary btn-sm" id="createRoundBtn" style="margin-top:10px;">Create Round</button>
+      </div>` : ''}
+      ${active ? renderActiveRoundHTML(active, members, perms) : `<div class="rd-panel"><p style="color:var(--rd-muted);font-size:13px;">No active round right now.</p></div>`}
+      <div class="rd-panel">
+        <p class="rd-panel-title">Past rounds</p>
+        ${state.discussionRounds.filter(r=>r.status!=='active').map(r=>`<p style="font-size:12.5px;color:var(--rd-muted);margin:4px 0;">Round ${r.round_number} — ${r.round_type} <span style="color:var(--rd-text);">${r.status}</span></p>`).join('') || '<p style="font-size:12.5px;color:var(--rd-muted);">None yet.</p>'}
+      </div>
+    `;
+    wrap.querySelector('#createRoundBtn')?.addEventListener('click', async e=>{
+      const btn = e.currentTarget; btn.disabled = true;
+      try{
+        const round = await createDiscussionRound(room.id, state.discussionActiveTopic?.id, wrap.querySelector('#roundType').value, wrap.querySelector('#roundQuestion').value.trim(), Number(wrap.querySelector('#roundTimer').value));
+        await startDiscussionRound(round.id, null);
+        toast('Round started');
+        await refreshRoundsTab();
+      }catch(err){ toast(err.message || 'Could not start round'); }
+      btn.disabled = false;
+    });
+    wrap.querySelectorAll('[data-select-participant]').forEach(sel=>sel.addEventListener('change', async e=>{
+      try{ await selectRoundParticipant(active.id, e.target.value || null); toast('Participant selected'); await refreshRoundsTab(); }
+      catch(err){ toast(err.message); }
+    }));
+    wrap.querySelector('#endRoundBtn')?.addEventListener('click', async ()=>{
+      try{ await endDiscussionRound(active.id); toast('Round ended'); await refreshRoundsTab(); }catch(err){ toast(err.message); }
+    });
+    if (active){
+      const answers = await loadAnswersForRound(active.id);
+      const answersWrap = wrap.querySelector('#roundAnswers');
+      if (answersWrap) drawRoundAnswers(answersWrap, answers, perms);
+      const myAnswer = answers.find(a=>a.user_id===state.session.user.id);
+      const canAnswer = !myAnswer && (!active.current_participant_id || active.current_participant_id===state.session.user.id);
+      const submitBtn = wrap.querySelector('#submitAnswerBtn');
+      if (submitBtn){
+        submitBtn.disabled = !canAnswer;
+        submitBtn.addEventListener('click', async e=>{
+          const val = wrap.querySelector('#myAnswerInput').value.trim();
+          if (!val){ toast('Write your answer first'); return; }
+          const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Submitting...';
+          try{
+            await submitDiscussionAnswer(active.id, val);
+            toast('Answer submitted');
+            await refreshRoundsTab();
+          }catch(err){ btn.disabled=false; btn.textContent='Submit answer'; toast(err.message || 'Could not submit — is it your turn?'); }
+        });
+      }
+    }
+  }
+}
+function renderActiveRoundHTML(round, members, perms){
+  const participantName = round.current_participant_id ? (members.find(m=>m.user_id===round.current_participant_id)?.profiles?.name || 'Someone') : 'Anyone (open round)';
+  return `
+    <div class="rd-panel" style="border-color:var(--rd-cyan);">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
+        <p class="rd-panel-title" style="margin:0;">Round ${round.round_number} — ${round.round_type.toUpperCase()}</p>
+        <span class="tag" style="background:var(--rd-cyan);color:#04222A;">⏱ ${round.timer_seconds}s</span>
+      </div>
+      <p style="color:var(--rd-text);font-size:15px;margin:10px 0;">${esc(round.question)}</p>
+      <p style="color:var(--rd-cyan);font-size:12.5px;font-weight:600;">${esc(participantName)} — Your Turn</p>
+      ${perms.canModerate ? `
+        <select id="roundParticipantSelect" data-select-participant>
+          <option value="">Open to anyone</option>
+          ${members.map(m=>`<option value="${m.user_id}" ${round.current_participant_id===m.user_id?'selected':''}>${esc(m.profiles?.name||m.profiles?.username)}</option>`).join('')}
+        </select>
+        <button class="rd-btn rd-btn-danger btn-sm" id="endRoundBtn" style="margin-top:8px;">End Round</button>
+      ` : ''}
+      <div style="margin-top:12px;display:flex;gap:8px;">
+        <input id="myAnswerInput" class="rd-input" placeholder="Type your answer..." style="flex:1;">
+        <button class="rd-btn rd-btn-primary btn-sm" id="submitAnswerBtn">Submit answer</button>
+      </div>
+      <div id="roundAnswers" style="margin-top:14px;"></div>
+    </div>
+  `;
+}
+function drawRoundAnswers(wrap, answers, perms){
+  wrap.innerHTML = answers.length ? `<p style="font-size:12px;font-weight:600;color:var(--rd-muted);margin-bottom:6px;">Answers</p>` + answers.map(a=>`
+    <div style="background:rgba(255,255,255,0.04);border-radius:10px;padding:10px;margin-bottom:8px;">
+      <p style="font-size:12.5px;font-weight:600;color:var(--rd-text);margin:0 0 4px;">${esc(a.profiles?.name||a.profiles?.username)} ${a.evaluated_at?`<span style="color:var(--rd-cyan);">— ${a.total_score} pts</span>`:''}</p>
+      <p style="font-size:13px;color:var(--rd-text);margin:0 0 6px;">${esc(a.content)}</p>
+      ${perms.canModerate ? `<button class="rd-btn btn-sm" data-score-answer="${a.id}">${a.evaluated_at?'Re-score':'Score this answer'}</button>` : (a.feedback ? `<p style="font-size:12px;color:var(--rd-muted);">💬 ${esc(a.feedback)}</p>` : '')}
+    </div>`).join('') : `<p style="font-size:12.5px;color:var(--rd-muted);">No answers yet.</p>`;
+  wrap.querySelectorAll('[data-score-answer]').forEach(b=>b.addEventListener('click', ()=>openScoreModal(b.dataset.scoreAnswer, answers.find(a=>a.id===b.dataset.scoreAnswer))));
+}
+function openScoreModal(answerId, answer){
+  openModal(`
+    <div class="modal">
+      <h3>Score this answer</h3>
+      <p style="font-size:13px;color:var(--ink-soft);">"${esc(answer.content)}"</p>
+      ${['knowledge','reasoning','creativity','relevance','communication'].map(k=>`
+        <label style="text-transform:capitalize;">${k} (0-10)</label><input type="number" id="sc-${k}" min="0" max="10" value="${answer[k+'_score']||0}">
+      `).join('')}
+      <label>Bonus points (0-20)</label><input type="number" id="sc-bonus" min="0" max="20" value="${answer.bonus_points||0}">
+      <label>Feedback</label><textarea id="sc-feedback" rows="2">${esc(answer.feedback||'')}</textarea>
+      <div class="modal-actions"><button class="btn btn-secondary" id="cancelSc">Cancel</button><button class="btn btn-primary" id="saveSc">Save score</button></div>
+    </div>
+  `);
+  document.getElementById('cancelSc').addEventListener('click', closeModal);
+  document.getElementById('saveSc').addEventListener('click', async e=>{
+    const btn = e.currentTarget; btn.disabled = true;
+    try{
+      await scoreDiscussionAnswer(answerId, {
+        knowledge: Number(document.getElementById('sc-knowledge').value),
+        reasoning: Number(document.getElementById('sc-reasoning').value),
+        creativity: Number(document.getElementById('sc-creativity').value),
+        relevance: Number(document.getElementById('sc-relevance').value),
+        communication: Number(document.getElementById('sc-communication').value),
+        bonus: Number(document.getElementById('sc-bonus').value),
+        feedback: document.getElementById('sc-feedback').value.trim(),
+      });
+      closeModal(); toast('Score saved');
+      renderRoute();
+    }catch(err){ btn.disabled=false; toast(err.message || 'Could not save score'); }
+  });
+}
+
+function renderPollsTab(body, room, perms){
+  body.innerHTML = `
+    ${perms.canModerate ? `<div class="rd-panel"><button class="rd-btn rd-btn-primary btn-sm" id="newPollBtn">+ New poll</button></div>` : ''}
+    <div id="pollsList"></div>
+  `;
+  body.querySelector('#newPollBtn')?.addEventListener('click', ()=>openNewPollModal(room, ()=>refreshPolls()));
+  refreshPolls();
+  async function refreshPolls(){
+    const polls = await loadActivePolls(room.id);
+    const wrap = body.querySelector('#pollsList');
+    wrap.innerHTML = polls.length ? polls.map(p=>{
+      const total = p.votes.length || 1;
+      const myVote = p.votes.find(v=>v.user_id===state.session.user.id);
+      return `<div class="rd-panel">
+        <p class="rd-panel-title">📊 ${esc(p.question)}</p>
+        ${p.discussion_poll_options.sort((a,b)=>a.position-b.position).map(o=>{
+          const count = p.votes.filter(v=>v.option_id===o.id).length;
+          const pct = Math.round((count/total)*100);
+          return `<div style="margin-bottom:8px;">
+            <div style="display:flex;justify-content:space-between;font-size:12.5px;color:var(--rd-text);"><span>${esc(o.label)}</span><span>${pct}% (${count})</span></div>
+            <div style="background:rgba(255,255,255,0.08);border-radius:6px;height:8px;overflow:hidden;margin-top:3px;"><div style="width:${pct}%;height:100%;background:var(--rd-cyan);"></div></div>
+            ${!myVote ? `<button class="rd-btn btn-sm" data-vote="${p.id}:${o.id}" style="margin-top:4px;">Vote</button>` : ''}
+          </div>`;
+        }).join('')}
+      </div>`;
+    }).join('') : `<div class="empty"><p>No polls yet.</p></div>`;
+    wrap.querySelectorAll('[data-vote]').forEach(b=>b.addEventListener('click', async ()=>{
+      const [pollId, optionId] = b.dataset.vote.split(':');
+      try{ await voteOnPoll(pollId, optionId); await refreshPolls(); }catch(err){ toast(err.message); }
+    }));
+  }
+}
+function openNewPollModal(room, onDone){
+  openModal(`
+    <div class="modal">
+      <h3>Create a poll</h3>
+      <label>Question</label><input id="pqQuestion" placeholder="e.g. Which solution is most practical?">
+      <label>Options (one per line)</label><textarea id="pqOptions" rows="4" placeholder="Solar\nWind\nNuclear\nHydroelectric"></textarea>
+      <div class="modal-actions"><button class="btn btn-secondary" id="cancelPq">Cancel</button><button class="btn btn-primary" id="savePq">Create Poll</button></div>
+    </div>
+  `);
+  document.getElementById('cancelPq').addEventListener('click', closeModal);
+  document.getElementById('savePq').addEventListener('click', async ()=>{
+    const question = document.getElementById('pqQuestion').value.trim();
+    const options = document.getElementById('pqOptions').value.split('\n').map(s=>s.trim()).filter(Boolean);
+    if (!question || options.length<2){ toast('Add a question and at least 2 options'); return; }
+    try{ await createDiscussionPoll(room.id, question, options); closeModal(); toast('Poll created'); onDone(); }
+    catch(err){ toast(err.message); }
+  });
+}
+
+async function renderLeaderboardTab(body, room){
+  body.innerHTML = `<div class="rd-panel"><p class="rd-panel-title">🏆 Room Leaderboard</p><div id="lbList"></div></div>`;
+  const board = await loadDiscussionLeaderboard(room.id);
+  const medals = ['🥇','🥈','🥉'];
+  document.getElementById('lbList').innerHTML = board.length ? board.map((u,i)=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--rd-border);">
+      <span style="width:26px;text-align:center;font-size:15px;">${medals[i]||(i+1)}</span>
+      <div class="avatar sm" style="overflow:hidden;">${avatarInner(u.profile)}</div>
+      <div style="flex:1;min-width:0;"><p style="font-size:13.5px;font-weight:600;color:var(--rd-text);margin:0;">${esc(u.profile?.name||u.profile?.username||'Student')}</p><p style="font-size:11px;color:var(--rd-muted);margin:0;">${u.count} answer${u.count===1?'':'s'} · best ${u.best}</p></div>
+      <span style="font-family:var(--font-display);font-weight:700;color:var(--rd-cyan);">${u.total} pts</span>
+    </div>`).join('') : `<p style="font-size:12.5px;color:var(--rd-muted);">No scored answers yet.</p>`;
+}
+
+function renderTeacherTab(body, room, members, perms){
+  // Reuse the same teacher UX in Discussion Rooms. Human teachers use
+  // discussion_rooms.teacher_id; AI teachers use teacher_type/bot_teacher_id.
+  renderRoomTeacherTab(body, room, members, {canManage:perms.canManage});
+}
+
+function renderRulesTab(body, room, perms){
+  body.innerHTML = `
+    <div class="rd-panel">
+      <p class="rd-panel-title">📜 Room Rules</p>
+      <ol style="color:var(--rd-text);font-size:13.5px;line-height:2;padding-left:20px;margin:0;">
+        ${(room.rules||[]).map(r=>`<li>${esc(r)}</li>`).join('')}
+      </ol>
+    </div>
+  `;
+}
+
+async function showWinnerCelebration(room){
+  const achievements = await loadRoomAchievements(room.id);
+  const board = await loadDiscussionLeaderboard(room.id);
+  const medals = ['🥇','🥈','🥉'];
+  openModal(`
+    <div class="modal" style="text-align:center;">
+      <h3>🏆 Discussion Complete</h3>
+      <p style="color:var(--ink-soft);font-size:13px;">${esc(state.discussionActiveTopic?.title||room.name)}</p>
+      ${board.slice(0,3).map((u,i)=>`<p style="font-size:15px;margin:6px 0;">${medals[i]} ${esc(u.profile?.name||u.profile?.username)} — <strong>${u.total} pts</strong></p>`).join('')}
+      ${achievements.length ? `<div style="height:1px;background:var(--hair);margin:14px 0;"></div><p style="font-size:12px;font-weight:600;color:var(--ink-soft);">Special Awards</p>${achievements.map(a=>`<p style="font-size:13px;margin:4px 0;">${AWARD_LABELS[a.award_type]?.emoji||'🏅'} ${AWARD_LABELS[a.award_type]?.label||a.award_type} — ${esc(a.profiles?.name||a.profiles?.username)}</p>`).join('')}` : ''}
+      <p style="font-size:12px;color:var(--ink-faint);margin-top:14px;">Achievements have been added to each student's account.</p>
+      <div class="modal-actions"><button class="btn btn-primary" id="closeWinnerModal" style="width:100%;justify-content:center;">Done</button></div>
+    </div>
+  `);
+  document.getElementById('closeWinnerModal').addEventListener('click', ()=>{ closeModal(); go('discussion'); });
 }
 
 function renderBookmarks(){
@@ -2707,9 +4065,14 @@ function drawAuthForm(card, mode){
       <p style="text-align:center;font-size:12.5px;"><a href="#" id="toForgot" style="color:var(--indigo);font-weight:600;">Forgot password?</a></p>
       <p style="text-align:center;font-size:12.5px;color:var(--ink-soft);margin-top:6px;">New here? <a href="#" id="toSignup" style="color:var(--indigo);font-weight:600;">Create an account</a></p>
     `;
-    card.querySelector('#authSubmit').addEventListener('click', async ()=>{
+    card.querySelector('#authSubmit').addEventListener('click', async e=>{
+      const btn = e.currentTarget;
+      if (btn.disabled) return; // BUG FIX (#11): stops rapid double-clicks from firing two logins
+      btn.disabled = true; const original = btn.textContent; btn.textContent = 'Logging in...';
+      card.querySelector('#authError').textContent = '';
       try{ await signIn(card.querySelector('#authEmail').value.trim(), card.querySelector('#authPassword').value); }
       catch(err){ card.querySelector('#authError').textContent = err.message; }
+      finally{ btn.disabled = false; btn.textContent = original; }
     });
     card.querySelector('#toSignup').addEventListener('click', e=>{ e.preventDefault(); drawAuthForm(card, 'signup'); });
     card.querySelector('#toForgot').addEventListener('click', e=>{ e.preventDefault(); drawAuthForm(card, 'forgot'); });
@@ -2723,12 +4086,18 @@ function drawAuthForm(card, mode){
       <button class="btn btn-primary" id="authSubmit" style="width:100%;justify-content:center;margin-bottom:10px;">Sign up</button>
       <p style="text-align:center;font-size:12.5px;color:var(--ink-soft);">Already have an account? <a href="#" id="toLogin" style="color:var(--indigo);font-weight:600;">Log in</a></p>
     `;
-    card.querySelector('#authSubmit').addEventListener('click', async ()=>{
+    card.querySelector('#authSubmit').addEventListener('click', async e=>{
+      const btn = e.currentTarget;
+      if (btn.disabled) return;
+      btn.disabled = true; const original = btn.textContent; btn.textContent = 'Signing up...';
+      card.querySelector('#authError').textContent = '';
       try{
         await signUp(card.querySelector('#authEmail').value.trim(), card.querySelector('#authPassword').value, card.querySelector('#authUsername').value.trim(), card.querySelector('#authName').value.trim());
         toast('Check your email to confirm your account');
         drawAuthForm(card, 'login');
+        return; // form was just replaced — don't touch the old button below
       } catch(err){ card.querySelector('#authError').textContent = err.message; }
+      btn.disabled = false; btn.textContent = original;
     });
     card.querySelector('#toLogin').addEventListener('click', e=>{ e.preventDefault(); drawAuthForm(card, 'login'); });
   } else if (mode === 'forgot'){
@@ -2738,9 +4107,14 @@ function drawAuthForm(card, mode){
       <button class="btn btn-primary" id="authSubmit" style="width:100%;justify-content:center;margin-bottom:10px;">Send reset link</button>
       <p style="text-align:center;font-size:12.5px;"><a href="#" id="toLogin" style="color:var(--indigo);font-weight:600;">Back to login</a></p>
     `;
-    card.querySelector('#authSubmit').addEventListener('click', async ()=>{
+    card.querySelector('#authSubmit').addEventListener('click', async e=>{
+      const btn = e.currentTarget;
+      if (btn.disabled) return;
+      btn.disabled = true; const original = btn.textContent; btn.textContent = 'Sending...';
+      card.querySelector('#authError').textContent = '';
       try{ await sendPasswordReset(card.querySelector('#authEmail').value.trim()); toast('Reset link sent — check your email'); }
       catch(err){ card.querySelector('#authError').textContent = err.message; }
+      btn.disabled = false; btn.textContent = original;
     });
     card.querySelector('#toLogin').addEventListener('click', e=>{ e.preventDefault(); drawAuthForm(card, 'login'); });
   }
@@ -2756,7 +4130,7 @@ async function renderRoute(){
   const inRoomFullscreen = state.view === 'rooms' && !!state.activeRoomId;
   document.documentElement.classList.toggle('room-focus-mode', inRoomFullscreen);
   renderChrome();
-  const views = ['home','study','notes','test','livetest','rooms','doubts','live','private','dashboard','profile','bookmarks','admin'];
+  const views = ['home','study','notes','test','livetest','rooms','discussion','doubts','live','private','dashboard','profile','bookmarks','admin'];
   views.forEach(v=>{ const node = document.getElementById('view-'+v); if (node) node.hidden = state.view !== v; });
 
   if (state.view==='home') await renderHome();
@@ -2765,11 +4139,12 @@ async function renderRoute(){
   else if (state.view==='test') renderTestList(false);
   else if (state.view==='livetest') renderTestList(true);
   else if (state.view==='rooms') await renderRooms();
+  else if (state.view==='discussion') await renderDiscussionRooms();
   else if (state.view==='doubts') renderDoubts();
   else if (state.view==='live') await renderLive();
   else if (state.view==='private') await renderPrivate();
   else if (state.view==='dashboard') renderDashboard();
-  else if (state.view==='profile') renderProfile();
+  else if (state.view==='profile') await renderProfile();
   else if (state.view==='bookmarks') renderBookmarks();
   else if (state.view==='admin') await renderAdmin();
 }
@@ -2784,19 +4159,48 @@ async function boot(){
       </div>`;
     return;
   }
-  await refreshSession();
-  if (!state.session){
-    renderAuthGate(document.getElementById('app-root'));
-  } else {
-    document.getElementById('app-root').innerHTML = document.getElementById('app-template').innerHTML;
-    await Promise.all([loadSubjects(), loadNotes(), loadMyNotes(), loadQuestions(), loadTests(), loadMyRooms()]);
-    applyAppearance();
-    subscribeLive();
-    await loadLiveMessages();
-    await loadConversations();
-    await renderRoute();
+  try{
+    await refreshSession();
+    if (!state.session){
+      renderAuthGate(document.getElementById('app-root'));
+    } else {
+      document.getElementById('app-root').innerHTML = document.getElementById('app-template').innerHTML;
+      await loadEverythingForSession();
+      await renderRoute();
+    }
+    attachAuthListener();
+  }catch(err){
+    // BUG FIX (#12): if anything above throws (bad network, Supabase down,
+    // a missing table), the user used to get silently stuck on whatever
+    // half-rendered state was left — no message, no way forward except
+    // manually reloading. Now it's a clear, recoverable error screen.
+    console.error('[boot] startup failed:', err);
+    document.getElementById('app-root').innerHTML = `
+      <div style="max-width:440px;margin:80px auto;padding:24px;text-align:center;font-family:sans-serif;">
+        <h2>Something went wrong while loading</h2>
+        <p style="color:#666;line-height:1.6;margin-bottom:18px;">${esc(err.message || 'Unknown error')}</p>
+        <button id="bootRetryBtn" style="background:#332E7C;color:#fff;border:none;border-radius:10px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer;">Retry</button>
+      </div>`;
+    document.getElementById('bootRetryBtn')?.addEventListener('click', ()=>window.location.reload());
   }
-
+}
+// Loads every optional/secondary data source for the signed-in session.
+// Uses allSettled (#12) so that if, say, loadTests() fails for some reason,
+// the rest of the app (notes, questions, rooms...) still loads and works —
+// one broken feature no longer takes the whole startup down with it.
+async function loadEverythingForSession(){
+  const results = await Promise.allSettled([
+    loadSubjects(), loadNotes(), loadMyNotes(), loadQuestions(), loadTests(), loadMyRooms(), loadMyDiscussionRooms()
+  ]);
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') console.error('[boot] a startup data load failed (feature ' + i + '):', r.reason);
+  });
+  applyAppearance();
+  subscribeLive();
+  try{ await loadLiveMessages(); }catch(err){ console.error('[boot] loadLiveMessages failed:', err); }
+  try{ await loadConversations(); }catch(err){ console.error('[boot] loadConversations failed:', err); }
+}
+function attachAuthListener(){
   let currentUserId = state.session?.user?.id || null;
   supabase.auth.onAuthStateChange(async (event, session) => {
     // Supabase can fire SIGNED_IN again on tab focus / token refresh even though
@@ -2810,17 +4214,19 @@ async function boot(){
       if (session?.user?.id === currentUserId) { state.session = session; return; }
       currentUserId = session?.user?.id || null;
       state.session = session;
-      const { data: prof } = await supabase.from('profiles').select('*').eq('id', session.user.id).single();
-      state.profile = prof;
-      state.privateHidden = prof?.settings?.private_hidden || false;
-      document.getElementById('app-root').innerHTML = document.getElementById('app-template').innerHTML;
-      await Promise.all([loadSubjects(), loadNotes(), loadMyNotes(), loadQuestions(), loadTests(), loadMyRooms()]);
-    applyAppearance();
-      subscribeLive();
-      await loadLiveMessages();
-      await loadConversations();
-      state.view = 'home';
-      await renderRoute();
+      try{
+        const { data: prof, error } = await supabase.from('profiles').select('*').eq('id', session.user.id).single();
+        if (error) throw error;
+        state.profile = prof;
+        state.privateHidden = prof?.settings?.private_hidden || false;
+        document.getElementById('app-root').innerHTML = document.getElementById('app-template').innerHTML;
+        await loadEverythingForSession();
+        state.view = 'home';
+        await renderRoute();
+      }catch(err){
+        console.error('[auth] failed to load profile after sign-in:', err);
+        toast('Signed in, but something failed to load — try refreshing');
+      }
     } else if (event === 'SIGNED_OUT'){
       currentUserId = null;
       state.session = null;
